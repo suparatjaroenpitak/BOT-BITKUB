@@ -109,6 +109,7 @@ class TechnicalIndicatorEngine:
             "bb_middle": latest.get("bb_middle", 0),
             "ema_9": latest.get("ema_9", 0),
             "ema_21": latest.get("ema_21", 0),
+            "ema_50": latest.get("ema_50", 0),
             "sma_50": latest.get("sma_50", 0),
             "volume_ratio": latest.get("volume_ratio", 1),
         }
@@ -122,5 +123,7 @@ class TechnicalIndicatorEngine:
         signals["macd_bullish"] = signals["macd"] > signals["macd_signal"]
         signals["macd_bearish"] = signals["macd"] < signals["macd_signal"]
         signals["high_volume"] = signals["volume_ratio"] > 1.5
+        signals["trend_up"] = signals["ema_9"] > signals["ema_21"] > signals["ema_50"] > 0
+        signals["trend_down"] = signals["ema_9"] < signals["ema_21"] < signals["ema_50"] if signals["ema_50"] > 0 else False
 
         return signals

@@ -19,6 +19,7 @@ class Position:
     entry_time: datetime = field(default_factory=datetime.now)
     stop_loss_price: float = 0.0
     take_profit_price: float = 0.0
+    highest_price: float = 0.0
 
     @property
     def value(self) -> float:
@@ -48,9 +49,22 @@ class TradingStrategy:
 
         rsi = signals.get("rsi", 50)
         price = signals.get("price", 0)
+        ema_9 = signals.get("ema_9", 0)
         ema_21 = signals.get("ema_21", 0)
+        ema_50 = signals.get("ema_50", 0)
+        volume_ratio = float(signals.get("volume_ratio", 1) or 1)
+        ai_change_pct = float(ai_prediction.get("price_change_pct", 0) or 0)
         ai_direction = ai_prediction.get("direction", "unknown")
         ai_confidence = ai_prediction.get("confidence", 0)
+        trend_up = ema_9 > ema_21 > ema_50 > 0
+        trend_soft_up = ema_9 > ema_21 > 0
+        falling_trend = ema_9 < ema_21 < ema_50 if ema_50 > 0 else ema_9 < ema_21
+        strong_reversal = (
+            rsi <= max(self.config.rsi_buy_threshold - 4, 20)
+            and signals.get("macd_bullish", False)
+            and ai_direction == "up"
+            and ai_confidence >= self.config.strong_ai_buy_confidence
+        )
 
         # RSI condition
         if rsi < self.config.rsi_buy_threshold:
@@ -59,13 +73,24 @@ class TradingStrategy:
 
         # Price below EMA
         if price < ema_21 and ema_21 > 0:
-            score += 1
+            score += 0.5
             reasons.append(f"Price ({price:.2f}) below EMA21 ({ema_21:.2f})")
 
+        if trend_up:
+            score += 0.75
+            reasons.append("Trend filter passed: EMA9 > EMA21 > EMA50")
+        elif trend_soft_up:
+            score += 0.35
+            reasons.append("Short-term trend still positive")
+
         # AI prediction UP
-        if ai_direction == "up" and ai_confidence > 0.3:
+        if ai_direction == "up" and ai_confidence >= self.config.min_ai_buy_confidence:
             score += 1
             reasons.append(f"AI predicts UP (confidence: {ai_confidence:.2f})")
+
+        if ai_change_pct > 0.35:
+            score += 0.35
+            reasons.append(f"AI expects upside {ai_change_pct:.2f}%")
 
         # Additional confirmations
         if signals.get("macd_bullish", False):
@@ -76,13 +101,29 @@ class TradingStrategy:
             score += 0.5
             reasons.append("Price below Bollinger lower band")
 
-        should = score >= 2  # Need at least 2 out of 3 main conditions
+        if volume_ratio >= self.config.min_volume_ratio:
+            score += 0.35
+            reasons.append(f"Volume support confirmed ({volume_ratio:.2f}x)")
+        elif ai_confidence < self.config.strong_ai_buy_confidence:
+            score -= 0.4
+            reasons.append(f"Volume too light ({volume_ratio:.2f}x), skipping weak setup")
+
+        if falling_trend and not strong_reversal:
+            score -= 1.0
+            reasons.append("Trend filter blocked buy in a falling market")
+
+        should = (
+            score >= self.config.min_buy_signal_score
+            and ai_direction == "up"
+            and ai_confidence >= self.config.min_ai_buy_confidence
+            and (trend_up or strong_reversal or (trend_soft_up and signals.get("price_below_bb_lower", False)))
+        )
 
         return {
             "should_buy": should,
             "score": score,
             "reasons": reasons,
-            "signal_strength": min(score / 3.0, 1.0),
+            "signal_strength": min(max(score / 4.0, 0.0), 1.0),
         }
 
     def should_sell(self, signals: Dict, ai_prediction: Dict,
@@ -101,8 +142,13 @@ class TradingStrategy:
         rsi = signals.get("rsi", 50)
         price = signals.get("price", 0)
         bb_upper = signals.get("bb_upper", float("inf"))
+        ema_9 = signals.get("ema_9", 0)
+        ema_21 = signals.get("ema_21", 0)
+        volume_ratio = float(signals.get("volume_ratio", 1) or 1)
         ai_direction = ai_prediction.get("direction", "unknown")
         ai_confidence = ai_prediction.get("confidence", 0)
+        ai_change_pct = float(ai_prediction.get("price_change_pct", 0) or 0)
+        trend_weak = price < ema_9 < ema_21 if ema_9 and ema_21 else price < ema_21
 
         # RSI condition
         if rsi > self.config.rsi_sell_threshold:
@@ -115,16 +161,34 @@ class TradingStrategy:
             reasons.append(f"Price ({price:.2f}) above BB upper ({bb_upper:.2f})")
 
         # AI prediction DOWN
-        if ai_direction == "down" and ai_confidence > 0.3:
+        if ai_direction == "down" and ai_confidence >= self.config.min_ai_sell_confidence:
             score += 1
             reasons.append(f"AI predicts DOWN (confidence: {ai_confidence:.2f})")
+
+        if trend_weak:
+            score += 0.6
+            reasons.append("Trend weakened: price < EMA9 < EMA21")
+
+        if ai_change_pct < -0.3:
+            score += 0.35
+            reasons.append(f"AI expects downside {ai_change_pct:.2f}%")
 
         # Additional confirmations
         if signals.get("macd_bearish", False):
             score += 0.5
             reasons.append("MACD bearish crossover")
 
-        should = score >= 2
+        if volume_ratio >= self.config.min_volume_ratio:
+            score += 0.2
+
+        if ai_direction == "up" and ai_confidence >= self.config.strong_ai_buy_confidence and not trend_weak:
+            score -= 0.75
+            reasons.append("Strong bullish AI bias delays sell")
+
+        should = (
+            score >= self.config.min_sell_signal_score
+            and (ai_direction == "down" or trend_weak or rsi >= self.config.rsi_sell_threshold + 4)
+        )
 
         return {
             "should_sell": should,
@@ -416,11 +480,27 @@ class TradingStrategy:
 
     def check_stop_loss(self, position: Position, current_price: float) -> bool:
         """Check if stop loss should be triggered."""
+        if position.highest_price <= 0:
+            position.highest_price = position.entry_price
+
+        position.highest_price = max(position.highest_price, current_price)
+
+        base_stop = position.entry_price * (1 - self.config.stop_loss_pct / 100)
         if position.stop_loss_price <= 0:
-            # Calculate from config
-            position.stop_loss_price = position.entry_price * (
-                1 - self.config.stop_loss_pct / 100
-            )
+            position.stop_loss_price = base_stop
+
+        dynamic_stop = max(position.stop_loss_price, base_stop)
+        pnl = self.get_position_pnl(position, current_price)
+
+        if pnl["profit_pct"] >= self.config.break_even_trigger_pct:
+            break_even_stop = position.entry_price * (1 + self.config.break_even_buffer_pct / 100)
+            dynamic_stop = max(dynamic_stop, break_even_stop)
+
+        if self.config.trailing_stop_enabled and pnl["profit_pct"] >= self.config.trailing_stop_trigger_pct:
+            trailing_stop = position.highest_price * (1 - self.config.trailing_stop_pct / 100)
+            dynamic_stop = max(dynamic_stop, trailing_stop)
+
+        position.stop_loss_price = dynamic_stop
 
         if current_price <= position.stop_loss_price:
             loss_pct = (
@@ -462,6 +542,7 @@ class TradingStrategy:
             amount=amount,
             stop_loss_price=sl_price,
             take_profit_price=tp_price,
+            highest_price=entry_price,
         )
         self.positions.append(position)
 

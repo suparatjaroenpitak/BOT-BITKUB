@@ -17,6 +17,7 @@ class RiskManager:
         self.logger = logger or TradeLogger()
         self.daily_loss: float = 0.0
         self.daily_trades: int = 0
+        self.consecutive_losses: int = 0
         self.last_reset_date: date = date.today()
 
     def _reset_daily_if_needed(self):
@@ -25,6 +26,7 @@ class RiskManager:
         if today != self.last_reset_date:
             self.daily_loss = 0.0
             self.daily_trades = 0
+            self.consecutive_losses = 0
             self.last_reset_date = today
             self.logger.log_info("Daily risk counters reset")
 
@@ -43,6 +45,20 @@ class RiskManager:
             checks["reasons"].append(
                 f"Daily loss limit reached: {self.daily_loss:.2f} >= "
                 f"{self.config.max_daily_loss_thb:.2f} THB"
+            )
+
+        if self.daily_trades >= self.config.max_daily_trades:
+            checks["allowed"] = False
+            checks["reasons"].append(
+                f"Daily trade limit reached: {self.daily_trades} >= "
+                f"{self.config.max_daily_trades}"
+            )
+
+        if self.consecutive_losses >= self.config.max_consecutive_losses:
+            checks["allowed"] = False
+            checks["reasons"].append(
+                f"Consecutive loss limit reached: {self.consecutive_losses} >= "
+                f"{self.config.max_consecutive_losses}"
             )
 
         # Check max open positions
@@ -66,16 +82,21 @@ class RiskManager:
         self._reset_daily_if_needed()
 
         # Max trade size
+        reserve_cash = balance * (self.config.cash_reserve_pct / 100)
+        tradable_balance = max(balance - reserve_cash, 0)
+
         max_trade = min(
             self.config.max_trade_size_thb,
             balance * (self.config.max_position_pct / 100),
+            tradable_balance,
         )
 
         # Adjust by signal strength (0.0 - 1.0)
-        adjusted_size = max_trade * max(signal_strength, 0.3)
+        loss_streak_factor = max(0.4, 1.0 - (0.18 * self.consecutive_losses))
+        adjusted_size = max_trade * max(signal_strength, 0.25) * loss_streak_factor
 
         # Ensure we don't exceed balance
-        position_size_thb = min(adjusted_size, balance * 0.95)
+        position_size_thb = min(adjusted_size, tradable_balance * 0.95)
 
         # Calculate crypto amount
         crypto_amount = position_size_thb / current_price if current_price > 0 else 0
@@ -95,11 +116,15 @@ class RiskManager:
 
         if profit_thb < 0:
             self.daily_loss += abs(profit_thb)
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
 
         self.logger.log_info(
             f"Trade recorded | P/L: {profit_thb:.2f} THB | "
             f"Daily loss: {self.daily_loss:.2f} THB | "
-            f"Daily trades: {self.daily_trades}"
+            f"Daily trades: {self.daily_trades} | "
+            f"Loss streak: {self.consecutive_losses}"
         )
 
     def get_risk_status(self, balance: float, positions: List[Position]) -> Dict:
@@ -123,5 +148,11 @@ class RiskManager:
             "max_daily_loss": self.config.max_daily_loss_thb,
             "remaining_daily_loss": remaining_daily_loss,
             "daily_trades": self.daily_trades,
-            "can_trade": remaining_daily_loss > 0 and len(positions) < self.config.max_open_positions,
+            "loss_streak": self.consecutive_losses,
+            "can_trade": (
+                remaining_daily_loss > 0
+                and len(positions) < self.config.max_open_positions
+                and self.daily_trades < self.config.max_daily_trades
+                and self.consecutive_losses < self.config.max_consecutive_losses
+            ),
         }

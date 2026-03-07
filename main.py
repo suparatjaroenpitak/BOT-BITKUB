@@ -246,6 +246,15 @@ class TradingBot:
 
     def _execute_sell(self, position, current_price: float, reason: str):
         """Execute a sell order back into THB."""
+        estimated_value = position.amount * current_price
+        if estimated_value < 10:
+            if position in self.strategy.positions:
+                self.strategy.positions.remove(position)
+            self.logger.log_info(
+                f"Skipping sell for {position.symbol}: remaining value {estimated_value:.2f} THB is below Bitkub minimum; position removed from bot tracking"
+            )
+            return None
+
         order = self.client.create_sell_order(position.symbol, position.amount)
         if "_error" in order:
             self.logger.log_error(

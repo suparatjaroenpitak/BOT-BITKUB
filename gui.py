@@ -1544,6 +1544,16 @@ class TradingBotGUI:
     def _do_quick_sell(self, symbol: str, amount: float, current_price: float):
         """Execute quick sell in background thread."""
         try:
+            estimated_value = amount * current_price
+            if estimated_value < 10:
+                self.root.after(
+                    0,
+                    self._log,
+                    f"⚠️ ขายไม่ได้เพราะมูลค่ารวมต่ำกว่า 10 THB ({estimated_value:,.2f} THB)",
+                    "WARN",
+                )
+                return
+
             order = self.client.create_sell_order(symbol, amount)
 
             # Check for API error
@@ -2385,6 +2395,19 @@ class TradingBotGUI:
         """Execute sell order back into THB."""
         if not self.client:
             return
+
+        estimated_value = position.amount * price
+        if estimated_value < 10:
+            if position in self.strategy.positions:
+                self.strategy.positions.remove(position)
+            self.root.after(
+                0,
+                self._log,
+                f"⚠️ ข้ามการขาย {position.symbol} เพราะมูลค่าคงเหลือเพียง {estimated_value:,.2f} THB ซึ่งต่ำกว่าขั้นต่ำ Bitkub; ตัดออกจากการติดตามของบอทแล้ว",
+                "WARN",
+            )
+            return None
+
         order = self.client.create_sell_order(position.symbol, position.amount)
         if "_error" in order:
             self.root.after(0, self._log,

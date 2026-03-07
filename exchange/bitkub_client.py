@@ -19,6 +19,8 @@ _TF_SECONDS = {
     "1h": 3600, "4h": 14400, "1d": 86400,
 }
 
+_MIN_ORDER_VALUE_THB = 10.0
+
 
 class BitkubClient:
     """Client for Bitkub exchange using direct REST API v3."""
@@ -257,6 +259,16 @@ class BitkubClient:
                          price: Optional[float] = None) -> Dict[str, Any]:
         """Create a buy order. Always uses limit order with market price if no price given."""
         try:
+            if amount_thb < _MIN_ORDER_VALUE_THB:
+                return {
+                    "_error": 15,
+                    "_raw": {
+                        "error": 15,
+                        "msg": f"Minimum buy amount is {_MIN_ORDER_VALUE_THB:.0f} THB",
+                        "amount_thb": amount_thb,
+                    },
+                }
+
             market_sym = symbol.lower()  # btc_thb (no flip for v3)
 
             # Always use limit order — Bitkub market orders (rat=0) are unreliable
@@ -328,6 +340,18 @@ class BitkubClient:
                     price = ticker["last"] * 0.998
                 else:
                     return {"_error": -2, "_raw": {"msg": "ดึงราคาไม่ได้"}}
+
+            estimated_value_thb = float(amount_crypto) * float(price)
+            if estimated_value_thb < _MIN_ORDER_VALUE_THB:
+                return {
+                    "_error": 15,
+                    "_raw": {
+                        "error": 15,
+                        "msg": f"Minimum sell value is {_MIN_ORDER_VALUE_THB:.0f} THB",
+                        "amount_crypto": amount_crypto,
+                        "estimated_value_thb": round(estimated_value_thb, 4),
+                    },
+                }
 
             payload: Dict[str, Any] = {
                 "sym": market_sym,

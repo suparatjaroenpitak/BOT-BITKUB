@@ -92,6 +92,7 @@ class TradingEnvironment:
             self.balance -= cost
             self.buy_price = current_price
             self.trades.append(("BUY", current_price, self.current_step))
+            reward = -commission / max(cost, 1.0) * 100
 
         elif action == self.SELL and self.crypto_held > 0:
             # Sell
@@ -100,7 +101,10 @@ class TradingEnvironment:
             net_revenue = revenue - commission
             profit = net_revenue - (self.initial_balance - self.balance)
             profit_pct = (current_price - self.buy_price) / self.buy_price
-            reward = profit_pct * 100  # Reward based on profit percentage
+            reward = profit_pct * 120
+            if profit_pct < 0:
+                reward += profit_pct * 80
+            reward -= self.commission * 100
 
             self.balance += net_revenue
             self.total_profit += profit
@@ -108,12 +112,11 @@ class TradingEnvironment:
             self.trades.append(("SELL", current_price, self.current_step))
 
         elif action == self.HOLD:
-            # Small penalty for holding to encourage action
             if self.crypto_held > 0:
                 unrealized = (current_price - self.buy_price) / self.buy_price
-                reward = unrealized * 0.1  # Small reward/penalty based on position
+                reward = unrealized * (0.15 if unrealized >= 0 else 0.35)
             else:
-                reward = -0.01  # Tiny penalty for being idle
+                reward = 0.0
 
         self.current_step += 1
         next_state = self._get_state()
