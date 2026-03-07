@@ -33,9 +33,25 @@ class TradingConfig:
     strong_ai_buy_confidence: float = 0.65
     strong_ai_sell_confidence: float = 0.60
     min_volume_ratio: float = 1.05
+    buy_zone_enabled: bool = True
+    buy_zone_rsi_max: float = 42.0
+    buy_zone_ema_gap_pct: float = 1.2
+    buy_zone_bb_buffer_pct: float = 0.8
+    buy_zone_min_ai_confidence: float = 0.30
+    support_resistance_window: int = 20
+    support_buffer_pct: float = 0.80
+    resistance_breakout_pct: float = 0.25
+    reversal_buy_min_ai_confidence: float = 0.72
+    reversal_buy_max_trend_gap_pct: float = 0.45
+    dip_buy_rsi_max: float = 40.0
+    dip_buy_max_ai_down_confidence: float = 0.82
+    trend_buy_min_ai_confidence: float = 0.40
+    quick_profit_sell_pct: float = 1.2
+    extended_profit_sell_pct: float = 2.8
+    profit_lock_rsi_threshold: float = 66.0
 
     # Stop Loss / Take Profit (percentage)
-    stop_loss_pct: float = 1.6
+    stop_loss_pct: float = 0.01
     take_profit_pct: float = 4.8
     break_even_trigger_pct: float = 0.9
     break_even_buffer_pct: float = 0.15
@@ -49,6 +65,16 @@ class TradingConfig:
     ai_cutloss_hard_limit_pct: float = 1.2
     ai_cutloss_min_lstm_confidence: float = 0.35
     ai_cutloss_min_rl_confidence: float = 0.25
+    adaptive_risk_enabled: bool = True
+    adaptive_cutloss_floor_pct: float = 0.20
+    adaptive_cutloss_ceiling_pct: float = 0.90
+    adaptive_hard_limit_ceiling_pct: float = 1.80
+    adaptive_rebuy_floor_pct: float = 0.25
+    adaptive_rebuy_ceiling_pct: float = 1.60
+    adaptive_reentry_delay_floor_pct: float = 0.40
+    adaptive_reentry_delay_ceiling_pct: float = 2.20
+    adaptive_rebuy_min_allocation_pct: float = 35.0
+    adaptive_rebuy_max_allocation_pct: float = 80.0
 
     # AI-driven scale-in / averaging down
     ai_scale_in_enabled: bool = False
@@ -132,6 +158,40 @@ class AppConfig:
             config.trading.min_ai_buy_confidence = float(min_ai_buy_conf)
         if min_ai_sell_conf := os.environ.get("MIN_AI_SELL_CONFIDENCE"):
             config.trading.min_ai_sell_confidence = float(min_ai_sell_conf)
+        if buy_zone_enabled := os.environ.get("BUY_ZONE_ENABLED"):
+            config.trading.buy_zone_enabled = buy_zone_enabled.lower() in {
+                "1", "true", "yes", "on",
+            }
+        if buy_zone_rsi_max := os.environ.get("BUY_ZONE_RSI_MAX"):
+            config.trading.buy_zone_rsi_max = float(buy_zone_rsi_max)
+        if buy_zone_ema_gap := os.environ.get("BUY_ZONE_EMA_GAP_PCT"):
+            config.trading.buy_zone_ema_gap_pct = float(buy_zone_ema_gap)
+        if buy_zone_bb_buffer := os.environ.get("BUY_ZONE_BB_BUFFER_PCT"):
+            config.trading.buy_zone_bb_buffer_pct = float(buy_zone_bb_buffer)
+        if buy_zone_ai_conf := os.environ.get("BUY_ZONE_MIN_AI_CONFIDENCE"):
+            config.trading.buy_zone_min_ai_confidence = float(buy_zone_ai_conf)
+        if sr_window := os.environ.get("SUPPORT_RESISTANCE_WINDOW"):
+            config.trading.support_resistance_window = int(sr_window)
+        if support_buffer := os.environ.get("SUPPORT_BUFFER_PCT"):
+            config.trading.support_buffer_pct = float(support_buffer)
+        if resistance_breakout := os.environ.get("RESISTANCE_BREAKOUT_PCT"):
+            config.trading.resistance_breakout_pct = float(resistance_breakout)
+        if reversal_buy_conf := os.environ.get("REVERSAL_BUY_MIN_AI_CONFIDENCE"):
+            config.trading.reversal_buy_min_ai_confidence = float(reversal_buy_conf)
+        if reversal_trend_gap := os.environ.get("REVERSAL_BUY_MAX_TREND_GAP_PCT"):
+            config.trading.reversal_buy_max_trend_gap_pct = float(reversal_trend_gap)
+        if dip_buy_rsi_max := os.environ.get("DIP_BUY_RSI_MAX"):
+            config.trading.dip_buy_rsi_max = float(dip_buy_rsi_max)
+        if dip_buy_ai_down_conf := os.environ.get("DIP_BUY_MAX_AI_DOWN_CONFIDENCE"):
+            config.trading.dip_buy_max_ai_down_confidence = float(dip_buy_ai_down_conf)
+        if trend_buy_ai_conf := os.environ.get("TREND_BUY_MIN_AI_CONFIDENCE"):
+            config.trading.trend_buy_min_ai_confidence = float(trend_buy_ai_conf)
+        if quick_profit_sell := os.environ.get("QUICK_PROFIT_SELL_PCT"):
+            config.trading.quick_profit_sell_pct = float(quick_profit_sell)
+        if extended_profit_sell := os.environ.get("EXTENDED_PROFIT_SELL_PCT"):
+            config.trading.extended_profit_sell_pct = float(extended_profit_sell)
+        if profit_lock_rsi := os.environ.get("PROFIT_LOCK_RSI_THRESHOLD"):
+            config.trading.profit_lock_rsi_threshold = float(profit_lock_rsi)
         if break_even_trigger := os.environ.get("BREAK_EVEN_TRIGGER_PCT"):
             config.trading.break_even_trigger_pct = float(break_even_trigger)
         if trailing_stop_enabled := os.environ.get("TRAILING_STOP_ENABLED"):

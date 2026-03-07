@@ -121,7 +121,7 @@ class Backtester:
 
                 # Sell signal
                 else:
-                    sell_decision = strategy.should_sell(signals, ai_pred)
+                    sell_decision = strategy.should_sell(signals, ai_pred, position)
                     if sell_decision["should_sell"]:
                         revenue = position.amount * current_price * (1 - commission)
                         profit = revenue - (position.entry_price * position.amount)

@@ -8,14 +8,14 @@ import numpy as np
 import ta
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator, EMAIndicator
-from ta.volatility import BollingerBands
+from ta.volatility import AverageTrueRange, BollingerBands
 
 
 class TechnicalIndicatorEngine:
     """Calculate technical indicators for trading signals."""
 
-    def __init__(self):
-        pass
+    def __init__(self, support_resistance_window: int = 20):
+        self.support_resistance_window = max(5, int(support_resistance_window))
 
     def add_all_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add all technical indicators to the DataFrame."""
@@ -25,6 +25,8 @@ class TechnicalIndicatorEngine:
         df = self.add_bollinger_bands(df)
         df = self.add_moving_averages(df)
         df = self.add_ema(df)
+        df = self.add_support_resistance(df, window=self.support_resistance_window)
+        df = self.add_volatility_indicators(df)
         df = self.add_volume_indicators(df)
         return df
 
@@ -85,6 +87,35 @@ class TechnicalIndicatorEngine:
             ).ema_indicator()
         return df
 
+    def add_volatility_indicators(self, df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
+        """Add volatility metrics used for adaptive risk controls."""
+        df = df.copy()
+        atr = AverageTrueRange(
+            high=df["high"], low=df["low"], close=df["close"], window=atr_period
+        )
+        df["atr"] = atr.average_true_range()
+        df["atr_pct"] = np.where(df["close"] > 0, (df["atr"] / df["close"]) * 100, 0.0)
+        return df
+
+    def add_support_resistance(self, df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+        """Add rolling support and resistance from prior candles."""
+        df = df.copy()
+        rolling_low = df["low"].rolling(window=window, min_periods=window).min().shift(1)
+        rolling_high = df["high"].rolling(window=window, min_periods=window).max().shift(1)
+        df["support_level"] = rolling_low
+        df["resistance_level"] = rolling_high
+        df["support_distance_pct"] = np.where(
+            rolling_low > 0,
+            ((df["close"] - rolling_low) / rolling_low) * 100,
+            np.nan,
+        )
+        df["resistance_distance_pct"] = np.where(
+            rolling_high > 0,
+            ((rolling_high - df["close"]) / rolling_high) * 100,
+            np.nan,
+        )
+        return df
+
     def add_volume_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add volume-based indicators."""
         df = df.copy()
@@ -107,10 +138,17 @@ class TechnicalIndicatorEngine:
             "bb_upper": latest.get("bb_upper", 0),
             "bb_lower": latest.get("bb_lower", 0),
             "bb_middle": latest.get("bb_middle", 0),
+            "bb_width": latest.get("bb_width", 0),
             "ema_9": latest.get("ema_9", 0),
             "ema_21": latest.get("ema_21", 0),
             "ema_50": latest.get("ema_50", 0),
             "sma_50": latest.get("sma_50", 0),
+            "support_level": latest.get("support_level", 0),
+            "resistance_level": latest.get("resistance_level", 0),
+            "support_distance_pct": latest.get("support_distance_pct", 0),
+            "resistance_distance_pct": latest.get("resistance_distance_pct", 0),
+            "atr": latest.get("atr", 0),
+            "atr_pct": latest.get("atr_pct", 0),
             "volume_ratio": latest.get("volume_ratio", 1),
         }
 

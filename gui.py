@@ -60,7 +60,9 @@ class TradingBotGUI:
         # Components (initialized on connect)
         self.client: Optional[BitkubClient] = None
         self.data_collector: Optional[MarketDataCollector] = None
-        self.indicator_engine = TechnicalIndicatorEngine()
+        self.indicator_engine = TechnicalIndicatorEngine(
+            support_resistance_window=self.config.trading.support_resistance_window
+        )
         self.strategy = TradingStrategy(self.config.trading, self.logger)
         self.risk_manager = RiskManager(self.config.risk, self.logger)
         self.lstm_predictor = LSTMPredictor(self.config.ai, self.logger)
@@ -82,6 +84,7 @@ class TradingBotGUI:
         self.ai_predicted = tk.StringVar(value="-")
         self.cycle_count = 0
         self.wallet_balances: Dict[str, Dict] = {}  # detailed balances
+        self.wallet_price_map: Dict[str, float] = {}
         self.is_connected = False
         self.initial_portfolio_value = 0.0  # portfolio value when bot started
         self.realtime_pnl = tk.StringVar(value="0.00 THB")
@@ -93,6 +96,8 @@ class TradingBotGUI:
         self.boss_cutloss_pct_var = tk.StringVar(value="0.6")
         self.boss_recovery_pct_var = tk.StringVar(value="0.8")
         self.boss_last_sell_price = 0.0  # track price at which boss sold
+        self.boss_recovery_low_price = 0.0
+        self.boss_rebuy_budget_thb = 0.0
         self.boss_waiting_recovery = False  # True = sold, waiting for price to recover before buy-back
 
         # Auto re-entry state
@@ -102,6 +107,7 @@ class TradingBotGUI:
         self.reentry_waiting = False
         self.reentry_symbol = ""
         self.reentry_last_exit_price = 0.0
+        self.reentry_recovery_low_price = 0.0
         self.reentry_budget_thb = 0.0
         self.reentry_last_reason = ""
 
@@ -1263,6 +1269,7 @@ class TradingBotGUI:
         thb_total = thb_info.get("total", 0)
 
         all_tickers = {}
+        price_map = {}
         try:
             all_tickers = client._get("/api/market/ticker")
         except Exception:
@@ -1285,6 +1292,8 @@ class TradingBotGUI:
             ticker_data = all_tickers.get(ticker_key, {})
             if ticker_data:
                 last_price = float(ticker_data.get("last", 0))
+                if last_price > 0:
+                    price_map[ticker_key] = last_price
                 value_thb = total * last_price
                 total_value_thb += value_thb
 
@@ -1308,14 +1317,74 @@ class TradingBotGUI:
             "thb_avail": thb_avail,
             "thb_total": thb_total,
             "wallet_rows": wallet_rows,
+            "price_map": price_map,
             "total_value_thb": total_value_thb,
             "all_symbols": all_symbols,
             "coin_count": len([coin for coin in wallet_balances if coin != "THB"]),
         }
 
+    def _sync_selected_position_from_wallet(self, snapshot: Optional[Dict] = None,
+                                            log_sync: bool = False):
+        """Adopt the currently selected wallet holding into bot tracking."""
+        symbol = self.config.trading.symbol
+        coin = symbol.split("_")[0]
+        wallet_state = snapshot.get("wallet_balances", {}) if snapshot else self.wallet_balances
+        price_map = snapshot.get("price_map", {}) if snapshot else self.wallet_price_map
+
+        coin_info = wallet_state.get(coin, {})
+        available_amount = float(coin_info.get("available", 0) or 0)
+        reserved_amount = float(coin_info.get("reserved", 0) or 0)
+        tracked_positions = self.strategy.get_open_positions(symbol)
+        tracked_amount = sum(max(position.amount, 0.0) for position in tracked_positions)
+        tolerance = max(1e-8, available_amount * 0.001)
+
+        if available_amount <= 0:
+            if reserved_amount <= 0 and tracked_positions and not self.bot_running:
+                self.strategy.positions = [
+                    position for position in self.strategy.positions
+                    if position.symbol != symbol
+                ]
+                if log_sync:
+                    self._log(
+                        f"ล้าง position ที่ sync ไว้สำหรับ {symbol} เพราะไม่พบยอดคงเหลือในกระเป๋าแล้ว",
+                        "INFO",
+                    )
+            return
+
+        if tracked_positions:
+            if len(tracked_positions) == 1 and abs(tracked_amount - available_amount) > tolerance:
+                tracked_positions[0].amount = available_amount
+                if log_sync:
+                    self._log(
+                        f"อัปเดต position จากกระเป๋าจริง {symbol} เป็น {available_amount:.8g}",
+                        "INFO",
+                    )
+            return
+
+        market_price = float(price_map.get(symbol, 0) or 0)
+        if market_price <= 0:
+            try:
+                market_price = float(self.current_price.get().replace(",", "").split()[0])
+            except (ValueError, IndexError):
+                market_price = 0.0
+
+        if market_price <= 0:
+            return
+
+        self.strategy.add_position(symbol, market_price, available_amount)
+        if log_sync:
+            reserved_text = (
+                f" | Reserved: {reserved_amount:.8g}" if reserved_amount > 0 else ""
+            )
+            self._log(
+                f"📋 Sync position จากกระเป๋าจริง {symbol}: {available_amount:.8g} @ {market_price:,.2f}{reserved_text}",
+                "INFO",
+            )
+
     def _apply_wallet_snapshot(self, snapshot: Dict, log_success: bool = True):
         """Update wallet widgets from pre-fetched data."""
         self.wallet_balances = snapshot.get("wallet_balances", {})
+        self.wallet_price_map = snapshot.get("price_map", {})
         thb_avail = snapshot.get("thb_avail", 0)
         thb_total = snapshot.get("thb_total", 0)
 
@@ -1333,6 +1402,7 @@ class TradingBotGUI:
 
         self.total_value.set(f"{snapshot.get('total_value_thb', 0):,.2f} THB")
         self.symbol_combo.config(values=snapshot.get("all_symbols", []))
+        self._sync_selected_position_from_wallet(snapshot, log_sync=log_success)
 
         if log_success:
             self._log(
@@ -1369,6 +1439,7 @@ class TradingBotGUI:
 
         self.config.trading.symbol = new_symbol
         self._log(f"เปลี่ยนเหรียญเป็น: {new_symbol}", "INFO")
+        self._sync_selected_position_from_wallet(log_sync=True)
 
         if self.is_connected and self.client:
             # Update price for new symbol
@@ -1476,29 +1547,29 @@ class TradingBotGUI:
             if crypto_amount <= 0:
                 crypto_amount = amount_thb / exec_price if exec_price else 0
 
-                # Apply SL/TP from settings
-                try:
-                    self.config.trading.stop_loss_pct = float(self.sl_var.get())
-                    self.config.trading.take_profit_pct = float(self.tp_var.get())
-                except ValueError:
-                    pass
+            # Apply SL/TP from settings
+            try:
+                self.config.trading.stop_loss_pct = float(self.sl_var.get())
+                self.config.trading.take_profit_pct = float(self.tp_var.get())
+            except ValueError:
+                pass
 
-                # Register position for bot monitoring
-                self.strategy.add_position(symbol, exec_price, crypto_amount)
+            # Register position for bot monitoring
+            self.strategy.add_position(symbol, exec_price, crypto_amount)
 
-                self.root.after(0, self._log,
-                    f"✅ ซื้อสำเร็จ! {symbol} @ {exec_price:,.2f} THB | "
-                    f"จำนวน: {crypto_amount:.8f} | "
-                    f"SL: {exec_price * (1 - self.config.trading.stop_loss_pct/100):,.2f} | "
-                    f"TP: {exec_price * (1 + self.config.trading.take_profit_pct/100):,.2f}",
-                    "SUCCESS")
-                self.root.after(0, self._add_history_entry, "BUY", exec_price, 0)
-                self.root.after(0, self._load_wallet)
-                self.root.after(0, self._update_pnl_display, exec_price)
+            self.root.after(0, self._log,
+                f"✅ ซื้อสำเร็จ! {symbol} @ {exec_price:,.2f} THB | "
+                f"จำนวน: {crypto_amount:.8f} | "
+                f"SL: {exec_price * (1 - self.config.trading.stop_loss_pct/100):,.2f} | "
+                f"TP: {exec_price * (1 + self.config.trading.take_profit_pct/100):,.2f}",
+                "SUCCESS")
+            self.root.after(0, self._add_history_entry, "BUY", exec_price, 0)
+            self.root.after(0, self._load_wallet)
+            self.root.after(0, self._update_pnl_display, exec_price)
 
-                # Auto-start bot if not running
-                if not self.bot_running:
-                    self.root.after(500, self._auto_start_bot_after_buy)
+            # Auto-start bot if not running
+            if not self.bot_running:
+                self.root.after(500, self._auto_start_bot_after_buy)
 
         except Exception as e:
             self.root.after(0, self._log, f"❌ Buy error: {e}", "ERROR")
@@ -1652,16 +1723,6 @@ class TradingBotGUI:
 
             ticker = self.client.get_ticker(symbol)
             current_price = ticker.get("last", 0) if ticker else 0
-            existing_positions = self.strategy.get_open_positions(symbol)
-            detected_position = None
-            if coin_total > 0 and not existing_positions and current_price > 0:
-                detected_position = {
-                    "symbol": symbol,
-                    "amount": coin_total,
-                    "entry_price": current_price,
-                    "coin": coin,
-                }
-
             model_messages = []
             try:
                 self.lstm_predictor.load_model()
@@ -1680,7 +1741,6 @@ class TradingBotGUI:
                 "coin": coin,
                 "coin_total": coin_total,
                 "thb_avail": thb_avail,
-                "detected_position": detected_position,
                 "initial_portfolio_value": thb_avail + (coin_total * current_price),
                 "model_messages": model_messages,
                 "auto_buy_amount": runtime_settings["auto_buy_amount"],
@@ -1692,19 +1752,8 @@ class TradingBotGUI:
     def _finish_start_bot(self, startup_context: Dict[str, object]):
         """Finalize bot startup on the Tkinter thread."""
         self._bot_start_in_progress = False
+        self._sync_selected_position_from_wallet(startup_context["wallet_snapshot"], log_sync=True)
         self._apply_wallet_snapshot(startup_context["wallet_snapshot"], log_success=False)
-
-        detected_position = startup_context.get("detected_position")
-        if detected_position:
-            self.strategy.add_position(
-                detected_position["symbol"],
-                detected_position["entry_price"],
-                detected_position["amount"],
-            )
-            self._log(
-                f"📋 ตรวจพบ {detected_position['coin']} ในกระเป๋า: {detected_position['amount']:.8g} | ลงทะเบียน position @ {detected_position['entry_price']:,.2f}",
-                "INFO",
-            )
 
         self.initial_portfolio_value = startup_context["initial_portfolio_value"]
         self.bot_running = True
@@ -1921,7 +1970,9 @@ class TradingBotGUI:
 
         # Step 7: If we recently sold this symbol, monitor for auto re-entry
         if not action:
-            action = self._check_auto_reentry(symbol, current_price, balance, positions)
+            action = self._check_auto_reentry(
+                symbol, current_price, balance, positions, signals, ai_prediction
+            )
 
         # Step 8: If no SL/TP, re-entry, or Boss action, check signals
         if not action:
@@ -1955,7 +2006,7 @@ class TradingBotGUI:
             self._log("🏆 Boss Mode: ON | AI CutLoss + Buy-Back เมื่อราคาฟื้น", "SUCCESS")
         else:
             self.boss_status_label.config(text="OFF", fg=COLORS["text_dim"])
-            self.boss_waiting_recovery = False
+            self._clear_boss_recovery_state()
             self._log("🏆 Boss Mode: OFF", "WARN")
 
     def _build_rl_live_decision(self, df_ind, position: Position) -> Dict:
@@ -1977,6 +2028,48 @@ class TradingBotGUI:
             return float(self.auto_trade_amount_var.get())
         except ValueError:
             return 0.0
+
+    def _update_recovery_tracker(self, exit_price: float, current_price: float,
+                                 tracked_low_price: float, recovery_pct: float) -> Dict:
+        """Track the lowest post-exit price and build a flexible re-buy trigger."""
+        low_price = tracked_low_price if tracked_low_price > 0 else exit_price
+        if low_price <= 0:
+            low_price = current_price
+
+        low_updated = False
+        if current_price > 0 and (low_price <= 0 or current_price < low_price):
+            low_price = current_price
+            low_updated = True
+
+        trigger_price = low_price * (1 + max(recovery_pct, 0.0) / 100) if low_price > 0 else 0.0
+        recovery_from_low_pct = (
+            (current_price - low_price) / low_price * 100 if low_price > 0 else 0.0
+        )
+        change_from_exit_pct = (
+            (current_price - exit_price) / exit_price * 100 if exit_price > 0 else 0.0
+        )
+
+        return {
+            "low_price": low_price,
+            "low_updated": low_updated,
+            "trigger_price": trigger_price,
+            "recovery_from_low_pct": recovery_from_low_pct,
+            "change_from_exit_pct": change_from_exit_pct,
+        }
+
+    def _clear_boss_recovery_state(self):
+        """Reset pending boss buy-back recovery tracking."""
+        self.boss_waiting_recovery = False
+        self.boss_last_sell_price = 0.0
+        self.boss_recovery_low_price = 0.0
+        self.boss_rebuy_budget_thb = 0.0
+
+    def _arm_boss_recovery_state(self, exit_price: float, budget_thb: float):
+        """Store recovery tracking state after a boss cutloss sell."""
+        self.boss_last_sell_price = exit_price
+        self.boss_recovery_low_price = exit_price
+        self.boss_rebuy_budget_thb = max(budget_thb, 0.0)
+        self.boss_waiting_recovery = True
 
     def _check_ai_scale_in(self, symbol: str, current_price: float, balance: float,
                            positions, signals: Dict, ai_prediction: Dict, df_ind) -> str:
@@ -2035,26 +2128,49 @@ class TradingBotGUI:
                          signals: Dict, df_ind, ai_prediction: Dict) -> str:
         """Boss Mode: AI confirms cutloss, sells to THB, then buys back on price recovery."""
         try:
-            cutloss_pct = float(self.boss_cutloss_pct_var.get())
-            recovery_pct = float(self.boss_recovery_pct_var.get())
+            base_cutloss_pct = float(self.boss_cutloss_pct_var.get())
+            base_recovery_pct = float(self.boss_recovery_pct_var.get())
         except ValueError:
-            cutloss_pct = 0.5
-            recovery_pct = 0.5
+            base_cutloss_pct = 0.5
+            base_recovery_pct = 0.5
+
+        adaptive_profile = self.strategy.get_adaptive_risk_profile(
+            signals,
+            ai_prediction,
+            base_cutloss_pct=base_cutloss_pct,
+            base_recovery_pct=base_recovery_pct,
+        )
+        cutloss_pct = adaptive_profile["cutloss_pct"]
+        recovery_pct = adaptive_profile["recovery_pct"]
+        rebuy_allocation_pct = adaptive_profile["rebuy_allocation_pct"]
 
         # Wait for price recovery after a boss cutloss before buying back.
         if self.boss_waiting_recovery and self.boss_last_sell_price > 0:
-            price_change_pct = (current_price - self.boss_last_sell_price) / self.boss_last_sell_price * 100
+            exit_price = self.boss_last_sell_price
+            tracker = self._update_recovery_tracker(
+                exit_price,
+                current_price,
+                self.boss_recovery_low_price,
+                recovery_pct,
+            )
+            self.boss_recovery_low_price = tracker["low_price"]
 
-            if price_change_pct >= recovery_pct:
+            if tracker["recovery_from_low_pct"] >= recovery_pct:
                 # Price recovered enough above the cutloss exit -> buy back.
-                buy_amount = min(balance, balance * 0.95)  # use 95% of available
+                target_budget = self.boss_rebuy_budget_thb or balance
+                buy_amount = min(
+                    balance * min(rebuy_allocation_pct / 100, 0.95),
+                    target_budget * (rebuy_allocation_pct / 100),
+                )
                 if buy_amount >= 10:
+                    tracked_low = self.boss_recovery_low_price
                     self._do_buy(symbol, buy_amount, current_price)
-                    self.boss_waiting_recovery = False
+                    self._clear_boss_recovery_state()
                     self.root.after(0, self._log,
                         f"🏆 BOSS BUY-BACK @ {current_price:,.2f} | "
-                        f"ราคาฟื้น {price_change_pct:+.2f}% จากจุดขาย ({self.boss_last_sell_price:,.2f}) | "
-                        f"ซื้อคืน ฿{buy_amount:,.0f}",
+                        f"ราคาฟื้น {tracker['recovery_from_low_pct']:+.2f}% จาก low {tracked_low:,.2f} "
+                        f"(ขายเดิม {exit_price:,.2f}) | "
+                        f"ซื้อคืน ฿{buy_amount:,.0f} | AI Recovery {recovery_pct:.2f}% | Allocation {rebuy_allocation_pct:.0f}%",
                         "TRADE")
                     return "BOSS_BUYBACK"
                 else:
@@ -2064,8 +2180,9 @@ class TradingBotGUI:
                 if self.cycle_count % 3 == 0:  # log every 3 cycles to avoid spam
                     self.root.after(0, self._log,
                         f"🏆 Boss รอราคาฟื้นเพื่อซื้อคืน | ราคา: {current_price:,.2f} | "
-                        f"จุดขาย: {self.boss_last_sell_price:,.2f} | "
-                        f"เปลี่ยนแปลง: {price_change_pct:+.2f}% (เป้าฟื้น: +{recovery_pct}%)",
+                        f"จุดขาย: {exit_price:,.2f} | low หลังขาย: {self.boss_recovery_low_price:,.2f} | "
+                        f"ฟื้นจาก low: {tracker['recovery_from_low_pct']:+.2f}% "
+                        f"(AI เป้าฟื้น: +{recovery_pct:.2f}% | trigger {tracker['trigger_price']:,.2f})",
                         "INFO")
             return ""
 
@@ -2076,8 +2193,31 @@ class TradingBotGUI:
             pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100
             pnl_thb = (current_price - pos.entry_price) * pos.amount
 
+            if self.strategy.check_stop_loss(pos, current_price):
+                record = self._do_sell(pos, current_price, "STOP_LOSS_TO_THB")
+                if record:
+                    self._arm_boss_recovery_state(current_price, record["amount"] * current_price)
+                    self.root.after(0, self._log,
+                        f"🔴 BOSS BACKUP STOP LOSS @ {current_price:,.2f} | "
+                        f"ขายกลับเป็น THB | ขาดทุน: {pnl_thb:,.2f} THB ({pnl_pct:+.2f}%) | "
+                        f"ชน SL {self.config.trading.stop_loss_pct:.4f}% ก่อน AI ยืนยันขาย",
+                        "TRADE")
+                    return "STOP_LOSS"
+
             if pnl_pct <= -cutloss_pct:
-                hard_limit = max(cutloss_pct, self.config.trading.ai_cutloss_hard_limit_pct)
+                rl_decision = self._build_rl_live_decision(df_ind, pos)
+                adaptive_profile = self.strategy.get_adaptive_risk_profile(
+                    signals,
+                    ai_prediction,
+                    pos,
+                    rl_decision,
+                    base_cutloss_pct=base_cutloss_pct,
+                    base_recovery_pct=base_recovery_pct,
+                )
+                cutloss_pct = adaptive_profile["cutloss_pct"]
+                recovery_pct = adaptive_profile["recovery_pct"]
+                rebuy_allocation_pct = adaptive_profile["rebuy_allocation_pct"]
+                hard_limit = adaptive_profile["hard_limit_pct"]
                 if not scale_in_checked and abs(pnl_pct) < hard_limit:
                     scale_in_checked = True
                     scale_in_action = self._check_ai_scale_in(
@@ -2086,7 +2226,6 @@ class TradingBotGUI:
                     if scale_in_action:
                         return scale_in_action
 
-                rl_decision = self._build_rl_live_decision(df_ind, pos)
                 ai_cutloss = self.strategy.evaluate_ai_cut_loss(
                     pos,
                     current_price,
@@ -2098,12 +2237,12 @@ class TradingBotGUI:
                 if ai_cutloss["should_sell"]:
                     record = self._do_sell(pos, current_price, ai_cutloss["reason"])
                     if record:
-                        self.boss_last_sell_price = current_price
-                        self.boss_waiting_recovery = True
+                        self._arm_boss_recovery_state(current_price, record["amount"] * current_price)
                         self.root.after(0, self._log,
                             f"🏆 AI BOSS CUTLOSS @ {current_price:,.2f} | "
                             f"ขายกลับเป็น THB | ขาดทุน: {pnl_thb:,.2f} THB ({pnl_pct:+.2f}%) | "
-                            f"รอราคาฟื้น +{recovery_pct}% จากจุดขายเพื่อซื้อคืน",
+                            f"AI CutLoss {cutloss_pct:.2f}% | Hard Limit {hard_limit:.2f}% | "
+                            f"รอราคาฟื้น +{recovery_pct:.2f}% จากจุดขายเพื่อซื้อคืน {rebuy_allocation_pct:.0f}% ของงบเดิม",
                             "TRADE")
                         return "AI_BOSS_CUTLOSS"
                 elif self.cycle_count % 3 == 0:
@@ -2153,6 +2292,12 @@ class TradingBotGUI:
             pnl_thb = (current_price - pos.entry_price) * pos.amount
             pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100
             rl_decision = self._build_rl_live_decision(df_ind, pos)
+            adaptive_profile = self.strategy.get_adaptive_risk_profile(
+                signals,
+                ai_prediction,
+                pos,
+                rl_decision,
+            )
 
             ai_take_profit = self.strategy.evaluate_ai_take_profit(
                 pos,
@@ -2184,13 +2329,16 @@ class TradingBotGUI:
                 current_price,
                 ai_prediction,
                 rl_decision,
+                min_loss_pct=adaptive_profile["cutloss_pct"],
+                hard_limit_pct=adaptive_profile["hard_limit_pct"],
             )
             if ai_cutloss["should_sell"]:
                 record = self._do_sell(pos, current_price, ai_cutloss["reason"])
                 if record:
                     self.root.after(0, self._log,
                                     f"🤖 AI CUTLOSS @ {current_price:,.2f} | "
-                                    f"ขายกลับเป็น THB | ขาดทุน: {pnl_thb:,.2f} THB ({pnl_pct:+.2f}%)",
+                                    f"ขายกลับเป็น THB | ขาดทุน: {pnl_thb:,.2f} THB ({pnl_pct:+.2f}%) | "
+                                    f"AI CutLoss {adaptive_profile['cutloss_pct']:.2f}% / Hard {adaptive_profile['hard_limit_pct']:.2f}%",
                                     "TRADE")
                     return "AI_CUTLOSS"
 
@@ -2214,7 +2362,8 @@ class TradingBotGUI:
         return ""
 
     def _check_auto_reentry(self, symbol: str, current_price: float,
-                            balance: float, positions) -> str:
+                            balance: float, positions, signals: Dict,
+                            ai_prediction: Dict) -> str:
         """Re-buy the same coin after an auto-sell only when price recovers.
 
         Rules:
@@ -2232,40 +2381,46 @@ class TradingBotGUI:
             return ""
 
         try:
-            rise_pct = float(self.reentry_rise_pct_var.get())
-            delay_pct = float(self.reentry_delay_pct_var.get())
+            base_rise_pct = float(self.reentry_rise_pct_var.get())
+            base_delay_pct = float(self.reentry_delay_pct_var.get())
         except ValueError:
-            rise_pct = 0.5
-            delay_pct = 1.0
+            base_rise_pct = 0.5
+            base_delay_pct = 1.0
 
-        change_from_exit_pct = (
-            (current_price - self.reentry_last_exit_price)
-            / self.reentry_last_exit_price * 100
+        adaptive_profile = self.strategy.get_adaptive_risk_profile(
+            signals,
+            ai_prediction,
+            base_recovery_pct=base_rise_pct,
         )
+        rise_pct = adaptive_profile["recovery_pct"]
+        delay_pct = max(base_delay_pct, adaptive_profile["delay_pct"])
+        rebuy_allocation_pct = adaptive_profile["rebuy_allocation_pct"]
 
-        if change_from_exit_pct <= -delay_pct:
-            if self.cycle_count % 3 == 0:
-                self.root.after(
-                    0,
-                    self._log,
-                    f"🔁 ชะลอการซื้อ {symbol} | ราคา {change_from_exit_pct:+.2f}% "
-                    f"ต่ำกว่าจุดขาย {self.reentry_last_exit_price:,.2f} "
-                    f"(เกณฑ์ชะลอ {delay_pct:.2f}%)",
-                    "WARN",
-                )
-            return "DELAY_BUY"
+        tracker = self._update_recovery_tracker(
+            self.reentry_last_exit_price,
+            current_price,
+            self.reentry_recovery_low_price,
+            rise_pct,
+        )
+        self.reentry_recovery_low_price = tracker["low_price"]
 
-        if change_from_exit_pct >= rise_pct:
-            buy_amount = min(balance * 0.95, self.reentry_budget_thb)
+        if tracker["recovery_from_low_pct"] >= rise_pct:
+            buy_amount = min(
+                balance * min(rebuy_allocation_pct / 100, 0.95),
+                self.reentry_budget_thb * (rebuy_allocation_pct / 100),
+            )
             if buy_amount >= 10:
+                tracked_low = self.reentry_recovery_low_price
+                exit_price = self.reentry_last_exit_price
                 self._do_buy(symbol, buy_amount, current_price)
                 self.reentry_waiting = False
                 self.root.after(
                     0,
                     self._log,
                     f"🔁 AUTO RE-BUY {symbol} @ {current_price:,.2f} | "
-                    f"ราคากลับขึ้น {change_from_exit_pct:+.2f}% จากจุดขาย | "
-                    f"ซื้อกลับ ฿{buy_amount:,.0f}",
+                    f"ราคาฟื้น {tracker['recovery_from_low_pct']:+.2f}% จาก low {tracked_low:,.2f} "
+                    f"(ขายเดิม {exit_price:,.2f}) | "
+                    f"ซื้อกลับ ฿{buy_amount:,.0f} | AI Recovery {rise_pct:.2f}% | Allocation {rebuy_allocation_pct:.0f}%",
                     "TRADE",
                 )
                 return "AUTO_REBUY"
@@ -2275,6 +2430,32 @@ class TradingBotGUI:
                 self._log,
                 f"🔁 ต้องการซื้อกลับ {symbol} แต่ THB ไม่พอ (มี ฿{balance:,.2f})",
                 "WARN",
+            )
+            return "REENTRY_WAIT"
+
+        if tracker["change_from_exit_pct"] <= -delay_pct:
+            if self.cycle_count % 3 == 0:
+                self.root.after(
+                    0,
+                    self._log,
+                    f"🔁 ชะลอการซื้อ {symbol} | ราคา {tracker['change_from_exit_pct']:+.2f}% "
+                    f"ต่ำกว่าจุดขาย {self.reentry_last_exit_price:,.2f} | "
+                    f"low หลังขาย {self.reentry_recovery_low_price:,.2f} | "
+                    f"ฟื้นจาก low {tracker['recovery_from_low_pct']:+.2f}% "
+                    f"(เกณฑ์ชะลอ {delay_pct:.2f}% | trigger {tracker['trigger_price']:,.2f})",
+                    "WARN",
+                )
+            return "DELAY_BUY"
+
+        if self.cycle_count % 3 == 0:
+            self.root.after(
+                0,
+                self._log,
+                f"🔁 รอจังหวะ Re-Buy {symbol} | ขายเดิม {self.reentry_last_exit_price:,.2f} | "
+                f"low หลังขาย {self.reentry_recovery_low_price:,.2f} | "
+                f"ฟื้นจาก low {tracker['recovery_from_low_pct']:+.2f}% "
+                f"(ต้องการ {rise_pct:.2f}% | trigger {tracker['trigger_price']:,.2f})",
+                "INFO",
             )
 
         return "REENTRY_WAIT"
@@ -2287,6 +2468,7 @@ class TradingBotGUI:
         self.reentry_waiting = True
         self.reentry_symbol = symbol
         self.reentry_last_exit_price = exit_price
+        self.reentry_recovery_low_price = exit_price
         self.reentry_budget_thb = max(exit_value_thb, 0.0)
         self.reentry_last_reason = reason
 
@@ -2297,6 +2479,7 @@ class TradingBotGUI:
         self.reentry_waiting = False
         self.reentry_symbol = ""
         self.reentry_last_exit_price = 0.0
+        self.reentry_recovery_low_price = 0.0
         self.reentry_budget_thb = 0.0
         self.reentry_last_reason = ""
 
@@ -2306,17 +2489,22 @@ class TradingBotGUI:
 
         # SELL signals - always check if we have positions
         if positions:
-            sell = self.strategy.should_sell(signals, ai_pred)
-            if sell["should_sell"]:
-                for pos in list(positions):
-                    pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
-                    pnl_thb = (price - pos.entry_price) * pos.amount
-                    self._do_sell(pos, price, "SELL_SIGNAL")
-                    self.root.after(0, self._log,
-                        f"📉 SELL signal | P/L: {pnl_thb:+,.2f} THB ({pnl_pct:+.2f}%)",
-                        "TRADE")
-                reasons = "; ".join(sell["reasons"])
-                self.root.after(0, self._log, f"  เหตุผล: {reasons}", "TRADE")
+            sold_any = False
+            last_reasons = ""
+            for pos in list(positions):
+                sell = self.strategy.should_sell(signals, ai_pred, pos)
+                if not sell["should_sell"]:
+                    continue
+                sold_any = True
+                last_reasons = "; ".join(sell["reasons"])
+                for_sell_pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
+                for_sell_pnl_thb = (price - pos.entry_price) * pos.amount
+                self._do_sell(pos, price, "SELL_SIGNAL")
+                self.root.after(0, self._log,
+                    f"📉 SELL signal | P/L: {for_sell_pnl_thb:+,.2f} THB ({for_sell_pnl_pct:+.2f}%)",
+                    "TRADE")
+            if sold_any:
+                self.root.after(0, self._log, f"  เหตุผล: {last_reasons}", "TRADE")
                 return "SELL"
 
         # BUY signals
@@ -2495,7 +2683,10 @@ class TradingBotGUI:
         # Boss mode status
         if self.boss_mode.get():
             if self.boss_waiting_recovery:
-                txt = f"🏆 Boss: รอราคาฟื้นเพื่อซื้อคืน (ขายที่ {self.boss_last_sell_price:,.2f})"
+                txt = (
+                    f"🏆 Boss: รอซื้อคืน | ขาย {self.boss_last_sell_price:,.2f} | "
+                    f"low {self.boss_recovery_low_price:,.2f}"
+                )
             else:
                 txt = "🏆 Boss: กำลังถือเหรียญ"
             self.bot_boss_status_label.config(text=txt, fg=COLORS["yellow"])
@@ -2505,8 +2696,8 @@ class TradingBotGUI:
         if self.reentry_waiting and self.reentry_symbol:
             self.bot_boss_status_label.config(
                 text=(
-                    f"🔁 Re-Buy รอ {self.reentry_symbol} @ "
-                    f"{self.reentry_last_exit_price:,.2f}"
+                    f"🔁 Re-Buy รอ {self.reentry_symbol} | ขาย {self.reentry_last_exit_price:,.2f} | "
+                    f"low {self.reentry_recovery_low_price:,.2f}"
                 ),
                 fg=COLORS["accent"],
             )

@@ -35,7 +35,9 @@ class TradingBot:
         # Initialize components
         self.client = BitkubClient(config.bitkub, self.logger)
         self.data_collector = MarketDataCollector(self.client, config.trading, self.logger)
-        self.indicator_engine = TechnicalIndicatorEngine()
+        self.indicator_engine = TechnicalIndicatorEngine(
+            support_resistance_window=config.trading.support_resistance_window
+        )
         self.strategy = TradingStrategy(config.trading, self.logger)
         self.risk_manager = RiskManager(config.risk, self.logger)
         self.lstm_predictor = LSTMPredictor(config.ai, self.logger)
@@ -195,17 +197,18 @@ class TradingBot:
 
         # Check SELL first
         if positions:
-            sell_decision = self.strategy.should_sell(signals, ai_prediction)
-            if sell_decision["should_sell"]:
-                sold_any = False
-                for position in positions:
-                    trade_record = self._execute_sell(
-                        position, current_price,
-                        "SELL_SIGNAL_TO_THB: " + "; ".join(sell_decision["reasons"])
-                    )
-                    sold_any = sold_any or bool(trade_record)
-                if sold_any:
-                    return "SELL"
+            sold_any = False
+            for position in positions:
+                sell_decision = self.strategy.should_sell(signals, ai_prediction, position)
+                if not sell_decision["should_sell"]:
+                    continue
+                trade_record = self._execute_sell(
+                    position, current_price,
+                    "SELL_SIGNAL_TO_THB: " + "; ".join(sell_decision["reasons"])
+                )
+                sold_any = sold_any or bool(trade_record)
+            if sold_any:
+                return "SELL"
 
         # Check BUY
         if not positions:
