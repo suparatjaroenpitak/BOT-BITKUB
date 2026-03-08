@@ -107,7 +107,12 @@ copy .env.example .env
 ```powershell
 $env:BITKUB_API_KEY = "your_api_key_here"
 $env:BITKUB_API_SECRET = "your_api_secret_here"
+$env:BUY_FEE_RATE = "0.0027"
+$env:SELL_FEE_RATE = "0.0027"
 ```
+
+- `BUY_FEE_RATE` และ `SELL_FEE_RATE` ใช้กำหนดค่าธรรมเนียมซื้อ/ขายของชุด BOT-BITKUB
+- ค่าเริ่มต้นถูกตั้งไว้ที่ `0.0027` ต่อฝั่ง เพื่อให้ conservative กว่า fee exchange จริงเล็กน้อยและสอดคล้องกับแอปหลัก
 
 ---
 

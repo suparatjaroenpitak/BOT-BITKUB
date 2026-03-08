@@ -240,7 +240,8 @@ class TradingBot:
             )
             return None
         if order:
-            crypto_amount = order.get("amount", amount_thb / price)
+            buy_fee_rate = max(float(getattr(self.config.trading, "buy_fee_rate", 0.0027) or 0.0), 0.0)
+            crypto_amount = order.get("amount", (amount_thb * (1 - buy_fee_rate)) / price if price else 0.0)
             executed_price = order.get("rate", price)
             self.strategy.add_position(symbol, executed_price, crypto_amount)
             self.logger.log_info(f"BUY executed: {symbol} @ {executed_price:.2f}")

@@ -49,6 +49,8 @@ class TradingConfig:
     quick_profit_sell_pct: float = 1.2
     extended_profit_sell_pct: float = 2.8
     profit_lock_rsi_threshold: float = 66.0
+    buy_fee_rate: float = 0.0027
+    sell_fee_rate: float = 0.0027
 
     # Stop Loss / Take Profit (percentage)
     stop_loss_pct: float = 0.01
@@ -192,6 +194,10 @@ class AppConfig:
             config.trading.extended_profit_sell_pct = float(extended_profit_sell)
         if profit_lock_rsi := os.environ.get("PROFIT_LOCK_RSI_THRESHOLD"):
             config.trading.profit_lock_rsi_threshold = float(profit_lock_rsi)
+        if buy_fee_rate := os.environ.get("BUY_FEE_RATE"):
+            config.trading.buy_fee_rate = float(buy_fee_rate)
+        if sell_fee_rate := os.environ.get("SELL_FEE_RATE"):
+            config.trading.sell_fee_rate = float(sell_fee_rate)
         if break_even_trigger := os.environ.get("BREAK_EVEN_TRIGGER_PCT"):
             config.trading.break_even_trigger_pct = float(break_even_trigger)
         if trailing_stop_enabled := os.environ.get("TRAILING_STOP_ENABLED"):

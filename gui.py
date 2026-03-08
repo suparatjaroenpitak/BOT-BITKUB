@@ -2567,12 +2567,13 @@ class TradingBotGUI:
                 f"❌ Auto-buy failed: error {order['_error']} | {order.get('_raw', '')}", "ERROR")
             return
         if order:
-            crypto_amount = order.get("amount", amount_thb / price if price else 0)
+            buy_fee_rate = max(float(getattr(self.config.trading, "buy_fee_rate", 0.0027) or 0.0), 0.0)
+            crypto_amount = order.get("amount", (amount_thb * (1 - buy_fee_rate)) / price if price else 0)
             exec_price = order.get("rate", price)
             if exec_price <= 0:
                 exec_price = price
             if crypto_amount <= 0:
-                crypto_amount = amount_thb / exec_price if exec_price else 0
+                crypto_amount = (amount_thb * (1 - buy_fee_rate)) / exec_price if exec_price else 0
             self.strategy.add_position(symbol, exec_price, crypto_amount)
             self._clear_auto_reentry(symbol)
             self.root.after(0, self._add_history_entry,

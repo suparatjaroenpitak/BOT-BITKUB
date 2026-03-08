@@ -44,7 +44,7 @@ class Backtester:
         self.indicator_engine = TechnicalIndicatorEngine()
 
     def run(self, df: pd.DataFrame, initial_balance: float = 100000.0,
-            commission: float = 0.0025,
+            commission: float = 0.0027,
             ai_predictions: Optional[List[Dict]] = None) -> BacktestResult:
         """
         Run backtest on historical data.
@@ -52,7 +52,7 @@ class Backtester:
         Args:
             df: OHLCV DataFrame
             initial_balance: Starting balance in THB
-            commission: Commission rate (0.25% for Bitkub)
+            commission: Commission rate (default 0.27% per side)
             ai_predictions: Optional list of AI predictions per bar
         """
         # Add indicators

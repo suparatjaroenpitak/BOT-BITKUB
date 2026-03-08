@@ -32,7 +32,7 @@ class TradingEnvironment:
     ACTION_SPACE = 3
 
     def __init__(self, df: pd.DataFrame, initial_balance: float = 100000.0,
-                 commission: float = 0.0025):
+                 commission: float = 0.0027):
         self.df = df.reset_index(drop=True)
         self.initial_balance = initial_balance
         self.commission = commission
