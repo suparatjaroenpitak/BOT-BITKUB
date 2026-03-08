@@ -18,3 +18,4 @@ torchvision>=0.16.0
 
 # Utilities
 python-dotenv>=1.0.0
+openai>=1.51.0

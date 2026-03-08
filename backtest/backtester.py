@@ -44,7 +44,7 @@ class Backtester:
         self.indicator_engine = TechnicalIndicatorEngine()
 
     def run(self, df: pd.DataFrame, initial_balance: float = 100000.0,
-            commission: float = 0.0027,
+            commission: float = 0.0025,
             ai_predictions: Optional[List[Dict]] = None) -> BacktestResult:
         """
         Run backtest on historical data.
@@ -52,7 +52,7 @@ class Backtester:
         Args:
             df: OHLCV DataFrame
             initial_balance: Starting balance in THB
-            commission: Commission rate (default 0.27% per side)
+            commission: Commission rate (0.25% for Bitkub)
             ai_predictions: Optional list of AI predictions per bar
         """
         # Add indicators
@@ -193,11 +193,18 @@ class Backtester:
             "macd_histogram": row.get("macd_histogram", 0),
             "bb_upper": row.get("bb_upper", 0),
             "bb_lower": row.get("bb_lower", 0),
+            "bb_width": row.get("bb_width", 0),
             "bb_middle": row.get("bb_middle", 0),
             "ema_9": row.get("ema_9", 0),
             "ema_21": row.get("ema_21", 0),
             "ema_50": row.get("ema_50", 0),
             "sma_50": row.get("sma_50", 0),
+            "support_level": row.get("support_level", 0),
+            "resistance_level": row.get("resistance_level", 0),
+            "support_distance_pct": row.get("support_distance_pct", np.nan),
+            "resistance_distance_pct": row.get("resistance_distance_pct", np.nan),
+            "atr": row.get("atr", 0),
+            "atr_pct": row.get("atr_pct", 0),
             "volume_ratio": row.get("volume_ratio", 1),
             "rsi_oversold": row.get("rsi", 50) < 35,
             "rsi_overbought": row.get("rsi", 50) > 70,
@@ -206,6 +213,8 @@ class Backtester:
             "price_below_bb_lower": row.get("close", 0) < row.get("bb_lower", float("-inf")),
             "macd_bullish": row.get("macd", 0) > row.get("macd_signal", 0),
             "macd_bearish": row.get("macd", 0) < row.get("macd_signal", 0),
+            "trend_up": row.get("ema_9", 0) > row.get("ema_21", 0) > row.get("ema_50", 0) > 0,
+            "trend_down": row.get("ema_9", 0) < row.get("ema_21", 0) < row.get("ema_50", 0) if row.get("ema_50", 0) > 0 else False,
         }
 
     def _simple_prediction(self, df: pd.DataFrame, index: int) -> Dict:

@@ -1,460 +1,377 @@
-# 🤖 Bitkub Crypto Auto Trading Bot
+# Bitkub Auto Trading Bot
 
-ระบบ Auto Trading Bot สำหรับ Bitkub Exchange พร้อม AI (LSTM + Reinforcement Learning) สำหรับพยากรณ์ราคาและตัดสินใจซื้อขายอัตโนมัติ พร้อมหน้า GUI แบบ Dark Theme
+บอทเทรด Bitkub ที่รวม GUI, paper trading, AI prediction, fee-aware P/L และระบบป้องกันความเสี่ยงสำหรับตลาดขาลง โดยเวอร์ชันปัจจุบันเน้น 3 เรื่องหลัก:
 
----
+- ลดการซื้อสวน downtrend ที่ยังไม่ฟื้นจริง
+- ลดขนาดไม้โดยอัตโนมัติเมื่อ ATR สูง, เทรนด์ลง, หรือแพ้ติดกัน
+- ลดการ cut loss ถี่จากการเข้าไม้เร็วเกินไปและการ buy-back เร็วเกินไป
 
-## 📁 Project Structure
+## โครงสร้างโปรเจกต์
 
-```
-bitkub-trading-bot/
-├── main.py                     # Entry point (trade / gui / backtest / train)
-├── gui.py                      # GUI Dashboard (Tkinter dark theme)
-├── config.py                   # Configuration (API, Trading, Risk, AI)
-├── requirements.txt            # Dependencies
-├── .env.example                # Environment variables template
-│
-├── exchange/                   # Exchange API Module
-│   ├── bitkub_client.py        # Bitkub REST API client (direct, ไม่ใช้ ccxt)
-│   └── data_collector.py       # Market data collector
-│
-├── strategy/                   # Trading Strategy Module
-│   ├── indicators.py           # Technical Indicator Engine (RSI, MACD, BB, EMA)
-│   ├── trading_strategy.py     # Buy/Sell/SL/TP logic + Position tracking
-│   └── risk_management.py      # Dynamic Risk Management
-│
-├── ai_model/                   # AI Models
-│   ├── lstm_model.py           # LSTM price prediction
-│   ├── rl_model.py             # RL trading decision agent (DQN)
-│   └── saved/                  # Saved model weights
-│
-├── backtest/                   # Backtesting System
-│   └── backtester.py           # Strategy backtester
-│
-├── dashboard/                  # Trading Dashboard
-│   └── trading_dashboard.py    # Console dashboard
-│
-├── utils/                      # Utilities
-│   └── logger.py               # Logging system
-│
-├── data/                       # Market data storage
-└── logs/                       # Log files
+```text
+Bitkub/
+├── main.py
+├── gui.py
+├── config.py
+├── requirements.txt
+├── exchange/
+├── strategy/
+├── ai_model/
+├── backtest/
+├── dashboard/
+├── utils/
+├── data/
+└── logs/
 ```
 
----
+## ความสามารถหลัก
 
-## 🚀 วิธีติดตั้ง
+- Technical indicators: RSI, MACD, Bollinger Bands, EMA, support/resistance, ATR, volume ratio
+- AI stack: LSTM prediction, RL agent, optional LLM advisor
+- Fee-aware position tracking: คำนวณต้นทุนเข้าและมูลค่าออกสุทธิหลังหักค่าธรรมเนียม
+- Paper trading: ใช้พอร์ตจำลองแยกจาก wallet จริง
+- Boss Mode: AI cut loss ไป THB แล้วรอ buy-back เมื่อราคาฟื้น
+- Adaptive risk sizing: ลด position size อัตโนมัติตาม market regime
+- GUI runtime controls: เปลี่ยนค่าระหว่างรันได้และระบบจะ apply ให้ทันทีโดยไม่ต้องหยุด auto trade พร้อม badge `EDIT / PENDING / LIVE / INVALID`
 
-### 1. ติดตั้ง Python 3.11+
+## สิ่งที่ปรับปรุงในเวอร์ชันนี้
 
-ดาวน์โหลดจาก [python.org](https://www.python.org/downloads/)
+### 0. UI ใช้งานง่ายขึ้น
 
-### 2. สร้าง Virtual Environment
+หน้าจอถูกจัดใหม่ให้ flow ชัดขึ้นกว่าเดิม:
+
+- ฝั่งขวามีการ์ด `Quick Start` บอกสถานะปัจจุบันและขั้นตอนถัดไป
+- ฝั่งซ้ายเลื่อนลงได้ ทำให้ดู `Market Data`, `P/L`, `Wallet`, `Indicators`, `Positions`, `Log` ได้ครบแม้จอไม่สูงมาก
+- sidebar ฝั่งขวาเลื่อนลงได้ ทำให้การตั้งค่าไม่ล้นหน้าจอในจอเล็ก
+- scrollbar ของทั้งสองฝั่งถูกทำให้มองเห็นและลากง่ายขึ้นกว่าก่อน
+- หมุนล้อเมาส์ได้จากทุก widget ภายในคอลัมน์ ไม่ต้องเล็งเฉพาะพื้นที่ว่างของ panel
+- กด `Shift` + ล้อเมาส์ เพื่อเลื่อนแบบเร็วเป็นหน้าในคอลัมน์ซ้ายหรือขวา
+- มีปุ่ม `TOP` และ `BOTTOM` อยู่เหนือคอลัมน์ซ้ายและขวา เพื่อกระโดดไปต้น/ท้าย panel ได้ทันที
+- การ์ด `Controls` แบ่งเป็น `Core Settings`, `Automation`, `Recovery`
+- การ์ด `Risk Status` อธิบายได้ทันทีว่าระบบกำลังลดไม้หรือพักซื้อเพราะอะไร
+- `Real-Time P/L` ถูกย้ายขึ้นมาอยู่ใกล้ข้อมูลหลักเพื่อดูพอร์ตง่ายขึ้น
+- `Quick Trade` มี 2 โหมด: `Manual Buy + Auto Trade` และ `Auto Trade Only`
+- การ์ดฝั่งขวาแต่ละใบสามารถกดปุ่ม `- / +` ที่หัวการ์ดเพื่อยุบ/ขยายได้ ช่วยประหยัดพื้นที่บนจอเล็ก
+
+### 1. Downtrend Guard
+
+บอทจะไม่รีบสะสมในตลาดลงเหมือนเดิมอีกแล้ว โดยการซื้อสวนเทรนด์จะเกิดได้ต่อเมื่อมีสัญญาณฟื้นตัวชัดเจนพร้อมกัน เช่น:
+
+- ราคา reclaim กลับเหนือ EMA9
+- MACD กลับเป็น bullish
+- volume ratio แข็งแรง
+- AI มองขึ้นด้วยความมั่นใจสูงพอ
+
+ผลคือ bot จะเข้าไม้ช้าลงใน downtrend แต่ลดการโดน cut loss ซ้ำในจุดเด้งหลอกได้ชัดเจนกว่าเดิม
+
+### 2. Adaptive Position Sizing
+
+GUI และ console mode ใช้ risk manager คุมขนาดไม้แล้ว โดยจะลดขนาดไม้เมื่อ:
+
+- ตลาดเป็น downtrend
+- ATR สูงกว่าค่าที่กำหนด
+- AI เอนลงแรง
+- มี loss streak ต่อเนื่อง
+
+ใน GUI ถึงแม้ช่อง `Auto Buy (THB)` จะใส่ไว้สูง ระบบก็ยัง cap ลงอัตโนมัติหาก risk regime ไม่เหมาะ
+
+### 3. Re-entry ที่ระวังขึ้น
+
+Boss buy-back และ auto re-buy ปรับให้รอมากขึ้น:
+
+- มี cooldown หลายรอบก่อนกลับเข้า
+- ต้อง confirm หลายรอบเหนือ trigger
+- มี trigger buffer เพิ่ม เพื่อกันการเด้งปลอม
+
+## ค่าเริ่มต้นปัจจุบัน
+
+### Trading Defaults
+
+| ค่า | ค่าเริ่มต้น |
+|---|---:|
+| Interval | 30 วินาที |
+| Stop Loss | 1.40% |
+| Take Profit | 4.80% |
+| AI CutLoss Review | 0.75% |
+| AI Hard CutLoss | 1.65% |
+| Buy Fee | 0.27% |
+| Sell Fee | 0.27% |
+
+### Risk Defaults
+
+| ค่า | ค่าเริ่มต้น |
+|---|---:|
+| Max Trade Size | 7,000 THB |
+| Max Position / Balance | 16% |
+| Cash Reserve | 25% |
+| Max Daily Loss | 3,000 THB |
+| Max Daily Trades | 8 |
+| Max Consecutive Losses | 3 |
+| Downtrend Position Scale | 45% ของไม้ปกติ |
+| High Volatility Scale | 70% ของไม้ปกติ |
+| Pause Buying in Downtrend After Loss Streak | 2 ไม้ |
+
+### GUI Runtime Defaults
+
+| ค่า | ค่าเริ่มต้น |
+|---|---:|
+| Auto Buy | 100 THB |
+| Boss CutLoss | 0.75% |
+| Boss Recovery | 0.70% |
+| Auto Re-Buy Rise | 0.70% |
+| Auto Re-Buy Delay | 0.90% |
+| Re-entry Cooldown | 2 รอบ |
+| Re-entry Confirm | 3 รอบ |
+
+## การติดตั้ง
+
+### 1. ติดตั้ง Python
+
+แนะนำ Python 3.11+
+
+### 2. สร้าง virtual environment
 
 ```powershell
-cd bitkub-trading-bot
-python -m venv venv
-.\venv\Scripts\Activate
+python -m venv .venv
+.\.venv\Scripts\Activate
 ```
 
-### 3. ติดตั้ง Dependencies
+### 3. ติดตั้ง dependencies
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 4. ติดตั้ง PyTorch (เลือกตาม GPU)
+### 4. ติดตั้ง PyTorch
 
-**CPU only:**
+CPU:
+
 ```powershell
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 ```
 
-**NVIDIA GPU (CUDA 12.1):**
+CUDA 12.1:
+
 ```powershell
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
----
+## การตั้งค่า API
 
-## 🔑 วิธีใส่ Bitkub API
+ใช้ environment variables หรือกรอกผ่าน GUI ก็ได้
 
-### 1. สร้าง API Key จาก Bitkub
-
-1. ไปที่ [Bitkub.com](https://www.bitkub.com) → Settings → API Keys
-2. สร้าง API Key ใหม่
-3. เปิดสิทธิ์ **Read** และ **Trade**
-4. **⚠️ อย่าเปิดสิทธิ์ Withdraw** (เพื่อความปลอดภัย)
-
-### 2. ใส่ API Key
-
-มี 3 วิธี:
-
-**วิธีที่ 1: ใส่ผ่าน GUI (แนะนำ)**
-- เปิดโปรแกรมด้วย `python main.py gui`
-.venv\Scripts\python.exe main.py gui
-- ใส่ API Key และ Secret ในช่อง 🔑 API SETTINGS
-- รองรับ **Ctrl+V วาง** และ **คลิกขวา > Paste**
-- กดปุ่ม 👁 เพื่อดู/ซ่อนรหัสได้
-
-**วิธีที่ 2: ใช้ .env file**
 ```powershell
-copy .env.example .env
-# แก้ไขไฟล์ .env ใส่ API Key และ Secret
+$env:BITKUB_API_KEY = "your_api_key"
+$env:BITKUB_API_SECRET = "your_api_secret"
 ```
 
-**วิธีที่ 3: ตั้งค่าผ่าน PowerShell**
-```powershell
-$env:BITKUB_API_KEY = "your_api_key_here"
-$env:BITKUB_API_SECRET = "your_api_secret_here"
-$env:BUY_FEE_RATE = "0.0027"
-$env:SELL_FEE_RATE = "0.0027"
-```
+ข้อควรระวัง: เปิดสิทธิ์แค่ `Read` และ `Trade` และไม่ควรเปิด `Withdraw`
 
-- `BUY_FEE_RATE` และ `SELL_FEE_RATE` ใช้กำหนดค่าธรรมเนียมซื้อ/ขายของชุด BOT-BITKUB
-- ค่าเริ่มต้นถูกตั้งไว้ที่ `0.0027` ต่อฝั่ง เพื่อให้ conservative กว่า fee exchange จริงเล็กน้อยและสอดคล้องกับแอปหลัก
+## วิธีรัน
 
----
-
-## 🏃 วิธีรัน Bot
-
-### 🖥️ รัน GUI Dashboard (แนะนำ)
+### GUI
 
 ```powershell
 python main.py gui
 ```
 
-### รัน Auto Trading (Console)
+### Console trade
 
 ```powershell
 python main.py trade
 ```
 
-### รัน Auto Trading พร้อมตั้งค่า
+### Paper trade
 
 ```powershell
-python main.py trade --symbol BTC_THB --interval 30 --sl 3.0 --tp 5.0
+python main.py trade --paper
 ```
 
-### รัน Backtest
+### Backtest
 
 ```powershell
 python main.py backtest
 ```
 
-### Train AI Model
+### Train AI
 
 ```powershell
 python main.py train
 ```
 
----
+## การใช้ GUI แบบปัจจุบัน
 
-## 🖥️ คู่มือใช้งาน GUI Dashboard
+### ภาพรวม layout
 
-### เปิดโปรแกรม
+หน้าจอถูกแบ่งเป็น 2 ฝั่งหลัก:
 
-```powershell
-python main.py gui
-```
+- ฝั่งซ้าย: ใช้ดูสถานะตลาดและสถานะพอร์ตแบบต่อเนื่อง
+- ฝั่งขวา: ใช้เชื่อมต่อ, ตั้งค่า, ควบคุมบอท และดูคำสั่งล่าสุด
 
-จะเปิดหน้าต่าง GUI แบบ Dark Theme ขนาด 1280x850 pixel
+รายละเอียดแต่ละฝั่ง:
 
-### แผงควบคุมหลัก
+| ฝั่ง | เนื้อหา |
+|---|---|
+| ซ้าย | `Market Data`, `สถานะและผลงานบอท`, `Real-Time P/L`, `Wallet`, `Technical Indicators`, `Open Positions`, `Activity Log` |
+| ขวา | `Quick Start`, `API Settings`, `Quick Trade`, `AI Prediction`, `Controls`, `Risk Status`, `Trade History` |
 
-GUI แบ่งเป็น **2 ฝั่ง**:
+การเลื่อนหน้าจอ:
 
-| ฝั่งซ้าย | ฝั่งขวา |
-|-----------|----------|
-| 📊 Market Data (ราคา, Balance, P/L) | 🔑 API Settings |
-| 💰 Wallet Balance (ตารางเหรียญ) | 💸 Quick Trade (ซื้อ/ขายเอง) |
-| 📈 Indicators (RSI, MACD, BB, EMA) | 🧠 AI Prediction |
-| 📋 Positions (ตำแหน่งเปิด) | ⚙️ Controls (ตั้งค่า Bot) |
-| 💹 Real-Time P/L (กำไร/ขาดทุน) | ⚠️ Risk Status |
-| 📝 Activity Log | 📜 Trade History |
+- ถ้าเนื้อหาฝั่งซ้ายยาวเกินหน้าจอ สามารถเลื่อนเมาส์บนฝั่งซ้ายเพื่อ scroll ได้
+- ถ้าเนื้อหาฝั่งขวายาวเกินหน้าจอ สามารถเลื่อนเมาส์บนฝั่งขวาเพื่อ scroll ได้
+- ระบบจะเลื่อนเฉพาะ panel ที่เมาส์กำลังชี้อยู่
+- สามารถลาก scrollbar ของแต่ละฝั่งได้โดยตรงเพื่อเลื่อนไปยังส่วนล่างได้เร็วขึ้น
+- ถ้าอยู่ในคอลัมน์ที่การ์ดแน่นมาก ให้ใช้ `Shift` + ล้อเมาส์ เพื่อเลื่อนแบบเป็นหน้า
+- ถ้าต้องการกระโดดไปส่วนบนหรือส่วนล่างของแต่ละฝั่งทันที ให้กด `TOP` หรือ `BOTTOM` เหนือ panel นั้น
+- การ์ดฝั่งขวาที่ไม่ได้ใช้งานชั่วคราวสามารถกด `-` เพื่อยุบเก็บ และกด `+` เพื่อเปิดกลับได้
 
----
+### 1. เชื่อมต่อ
 
-### ขั้นตอนที่ 1: เชื่อมต่อ Exchange
+- กรอก API Key / Secret
+- เลือก symbol
+- กด `Connect & Load Wallet`
 
-1. ใส่ **API Key** ในช่อง (Ctrl+V หรือคลิกขวา > Paste)
-2. ใส่ **API Secret** ในช่อง
-3. กดปุ่ม 👁 ตรวจสอบว่าใส่ถูกต้อง
-4. เลือก **เหรียญที่จะเทรด** (เช่น BTC_THB, ETH_THB)
-5. กดปุ่ม **🔗 Connect & Load Wallet**
-6. ถ้าสำเร็จจะแสดง ✅ Connected และโชว์ยอดเงินใน Wallet
+หลังเปิดแอพ ให้เริ่มดูที่การ์ด `Quick Start` มุมขวาบนก่อน เพราะจะแสดง:
 
----
+- สถานะการเชื่อมต่อ
+- โหมดปัจจุบัน `LIVE / PAPER`
+- สิ่งที่ควรทำต่อในขั้นตอนถัดไป
 
-### ขั้นตอนที่ 2: ซื้อเหรียญ (Quick Trade)
+ถ้ายังไม่ได้เชื่อมต่อ การ์ดนี้จะบอกชัดว่าควรเริ่มจาก `Connect & Load Wallet` ก่อน
 
-หลังเชื่อมต่อแล้ว จะเปิดใช้งาน **💸 QUICK TRADE**:
+### 2. ตั้งค่าการเทรด
 
-1. ใส่จำนวนเงิน THB ที่ต้องการซื้อ (ขั้นต่ำ 10 THB)
-2. กด **📈 BUY NOW** → ยืนยัน → Bot ซื้อเหรียญทันที
-3. หลังซื้อ Bot จะ **เริ่มทำงานอัตโนมัติ** เพื่อเฝ้าดูราคา
-4. Position จะถูกลงทะเบียนพร้อม SL/TP ตามค่าที่ตั้ง
+ในแผง `Controls` มีค่า runtime สำคัญดังนี้:
 
-**ขายเหรียญ:**
-- กด **📉 SELL ALL** → ขายเหรียญทั้งหมดของเหรียญที่เลือก
+- `Interval`, `SL`, `TP`
+- `Auto Buy (THB)`
+- `AI Scale-In`, `AI Take Profit`
+- `Paper Trading`
+- `Boss Mode`, `Boss CutLoss`, `Boss Recovery`
+- `Auto Re-Buy`, `Buy Up %`, `Delay Down %`
 
----
+เมื่อบอทกำลังรันอยู่:
 
-### ขั้นตอนที่ 3: ตั้งค่า Bot
+- ค่าที่แก้ใน `Controls` จะถูก apply เข้าระบบทันทีโดยไม่ต้องกด stop/start ใหม่
+- badge จะเปลี่ยนจาก `PENDING` เป็น `LIVE` เมื่อค่าถูกนำไปใช้แล้ว
+- ถ้ากรอกค่าผิด badge จะขึ้น `INVALID` และระบบจะใช้ค่าล่าสุดที่ถูกต้องต่อไป
+- `Paper Trading` ยังเป็นข้อยกเว้น: ห้ามสลับระหว่างบอทรัน เพื่อไม่ให้พอร์ตจำลองปนกับพอร์ตจริง
 
-ใน **⚙️ CONTROLS**:
+Layout ฝั่งขวาแบบใหม่:
 
-| ค่า | คำอธิบาย | ค่าเริ่มต้น |
-|------|----------|-------------|
-| Interval (s) | ความถี่ตรวจสอบราคา (วินาที) | 30 |
-| SL % | Stop Loss สำรอง ถ้า AI ยังไม่สั่งขาย | 1.8 |
-| TP % | Take Profit — กำไรกี่ % จะขายทำกำไร | 5.0 |
-| Auto Buy (THB) | จำนวนเงินที่ Auto Bot ใช้ซื้อเมื่อ AI ให้สัญญาณ BUY | 100 |
+- `Quick Start`: ดูภาพรวมและขั้นตอนถัดไป
+- `API Settings`: เชื่อมต่อและเลือกเหรียญ
+- `Quick Trade`: สั่งซื้อ/ขายเองแบบทันที
+- `AI Prediction`: ดูมุมมอง AI ล่าสุด
+- `Controls`: ตั้งค่าหลักของบอท
+- `Risk Status`: ตรวจ market regime และ risk guard
+- `Trade History`: ดูคำสั่งล่าสุด
+
+ทุกการ์ดในฝั่งขวาสามารถยุบ/ขยายได้จากปุ่มที่หัวการ์ด และ `Trade History` จะถูกยุบไว้ก่อนเป็นค่าเริ่มต้นเพื่อประหยัดพื้นที่แนวตั้ง
+
+โครง `Controls` แบ่งเป็น 3 ส่วนเพื่ออ่านง่ายขึ้น:
+
+- `Core Settings`: Interval, SL, TP, Auto Buy
+- `Automation`: AI Scale-In, AI Take Profit, LLM Trade, Paper Trading
+- `Recovery`: Boss Mode, Boss CutLoss, Boss Recovery, Auto Re-Buy
 
 หมายเหตุ:
-- ระบบปิดสถานะด้วยการส่งคำสั่งขายในคู่ THB เช่น BTC_THB เพื่อแปลงเหรียญกลับเป็นเงินบาทใน Bitkub
-- จึงไม่ใช่การถอนเหรียญออกนอกระบบ และไม่เกี่ยวกับค่าธรรมเนียมถอน
-- เมื่อ Bot กำลังทำงานอยู่ การแก้ค่าในพารามิเตอร์จะมีผลทันทีในรอบถัดไป โดยไม่ต้อง Stop/Start ใหม่
-- ค่า `Interval` ใหม่จะถูกนำไปใช้ระหว่างรอรอบทันที ส่วนการเปลี่ยน `Symbol` จะอนุญาตเฉพาะตอนที่ไม่มี position ค้างอยู่
-- Badge ข้างพารามิเตอร์: `EDIT` = มีการแก้แต่ยังไม่รัน, `PENDING` = เปลี่ยนแล้วกำลังรอใช้, `LIVE` = ค่าในช่องถูกใช้จริงแล้ว, `INVALID` = ค่าที่กรอกไม่ถูกต้อง
 
----
+- ถ้าหน้าจอสูงไม่พอ สามารถเลื่อน sidebar ฝั่งขวาลงได้
+- ถ้าต้องการดู log, positions, หรือ wallet เพิ่ม ให้เลื่อนฝั่งซ้ายลงได้เช่นกัน
 
-### ขั้นตอนที่ 4: เปิด Boss Mode 🏆
+หมายเหตุสำคัญ:
 
-**Boss Mode** คือระบบเทรดอัตโนมัติแบบ AI CutLoss + Re-Buy วนรอบ
+- ช่อง `Auto Buy (THB)` ไม่ได้แปลว่าระบบจะซื้อเต็มจำนวนทุกครั้ง
+- risk manager จะ cap ไม้ให้เหมาะกับสภาพตลาดก่อนส่งคำสั่งจริง
+- ถ้าอยู่ใน downtrend แรงหรือ ATR สูง ระบบอาจลดไม้จนต่ำกว่า 10 THB และข้ามรอบซื้อไปเลย
 
-| ค่า | คำอธิบาย | ค่าเริ่มต้น |
-|------|----------|-------------|
-| 🏆 Boss Mode | เปิด/ปิด Boss Mode | ✅ ON |
-| CutLoss % | ขาดทุนกี่ % แล้วให้ AI เริ่มพิจารณาขาย | 0.6 |
-| Recovery % | ราคาฟื้นกี่ % จากจุดขาย แล้วค่อยซื้อคืน | 0.8 |
+### 3. อ่านแผง `Risk Status`
 
-**วิธีทำงานของ Boss Mode:**
+ตอนนี้แผงนี้จะแสดงมากกว่า daily loss แบบเดิม:
 
-```
-┌─────────────────────────────────────────────┐
-│  ถือเหรียญอยู่                                │
-│  ↓                                           │
-│  ราคาลง ≥ CutLoss% (เช่น -0.5%)             │
-│  → AI ประเมินแนวโน้มลงต่อ + SELL            │
-│  → 🔴 ขายกลับเป็น THB ใน Bitkub              │
-│  → Bot ยังทำงานต่อ รอราคาฟื้นเพื่อซื้อคืน       │
-│  ↓                                           │
-│  ราคาฟื้น ≥ Recovery% จากจุดขาย (เช่น +0.5%)│
-│  → 🟢 ซื้อคืนอัตโนมัติ (BOSS BUY-BACK)      │
-│  → กลับไปถือเหรียญ วนรอบใหม่                  │
-└─────────────────────────────────────────────┘
-```
+- Daily loss / exposure / open positions
+- Market regime เช่น `Normal`, `Downtrend Guard`, `High Volatility`, `Downtrend + Volatility`
+- Position scale ที่ระบบใช้จริงในรอบนั้น
+- หมายเหตุว่าโดน guard จากอะไร เช่น downtrend, ATR สูง, volume เบา, AI downside
 
-**ตัวอย่าง:**
-1. ซื้อ BTC ที่ราคา 2,000,000 THB
-2. ราคาลงเหลือ 1,990,000 (-0.5%) → AI ยืนยัน cut loss แล้ว Bot ขายกลับเป็น THB อัตโนมัติ
-3. Bot รอดูราคา...
-4. ราคาขึ้นเป็น 2,000,000 (+0.5% จากจุดขาย) → Bot ซื้อคืน
-5. วนรอบต่อไปเรื่อยๆ
+การ์ดที่ควรดูคู่กันระหว่างใช้งาน:
 
-> 💡 **เคล็ดลับ:** ปิด Boss Mode ได้ตลอดเวลา → กลับไปใช้ SL/TP แบบปกติ
+- `Quick Start`: ดูว่าระบบคาดหวังให้ทำอะไรต่อ
+- `สถานะและผลงานบอท`: ดู action ล่าสุดและเหตุผลการตัดสินใจ
+- `Risk Status`: ดูว่าระบบกำลังลดไม้หรือพักซื้อหรือไม่
+- `Activity Log`: ดูลำดับเหตุการณ์ละเอียดในแต่ละรอบ
 
----
+ส่วนการ์ด `Quick Trade` จะถูกแยกบทบาทชัดเจนจาก `Auto Buy` ของบอท:
 
-### ขั้นตอนที่ 5: เริ่มใช้ Bot
+- `Manual Buy + Auto Trade`: ซื้อทันทีด้วยจำนวน THB ที่กรอก แล้วถ้าบอทยังไม่รัน ระบบจะเริ่ม auto trade ให้ดูแล position ต่อทันที
+- `Auto Trade Only`: ไม่ส่งคำสั่งซื้อแบบ manual แต่ให้บอทประเมิน BUY หนึ่งรอบทันที โดยใช้กฎเดียวกับ auto trade จริง ทั้ง AI, LLM gate, risk sizing และ Auto Buy cap
+- `Auto Buy` ใน `Controls` คือวงเงินอ้างอิงที่ระบบเอาไปคำนวณต่อกับ risk cap อีกชั้นสำหรับรอบ auto trade ปกติ
 
-1. กดปุ่ม **▶ START BOT**
-2. Bot จะเริ่มทำงานตามรอบ (ทุก 30 วินาที หรือตามที่ตั้ง)
-3. ถ้า AI ประเมินว่าถึงจังหวะ BUY ระบบจะส่งคำสั่งซื้อทันทีด้วยจำนวนเงินจากช่อง **Auto Buy (THB)**
-4. ดูข้อมูล real-time ได้ที่:
-   - **💹 Real-Time P/L** — กำไร/ขาดทุนปัจจุบัน (สีเขียว = กำไร, สีแดง = ขาดทุน)
-   - **📊 Market Data** — ราคาปัจจุบัน, Balance, Total Value
-   - **📝 Activity Log** — บันทึกทุกการทำงานของ Bot
-   - **📜 Trade History** — ประวัติการซื้อขาย
-5. กด **⏹ STOP BOT** เพื่อหยุด Bot
+### 4. ลำดับใช้งานแบบสั้นที่สุด
 
----
+ถ้าต้องการใช้งาน UI แบบง่ายที่สุด ให้ทำตามนี้:
 
-### ปุ่มเสริม
+1. เปิดแอพแล้วดู `Quick Start`
+2. กรอก API และกด `Connect & Load Wallet`
+3. ตั้ง `Paper Trading` หรือ `Live` ให้ถูกต้อง
+4. ตรวจ `Interval`, `SL`, `TP`, `Auto Buy`
+5. ถ้าต้องการสั่งซื้อเร็ว ให้เลือกโหมดใน `Quick Trade` ว่าจะ `Manual Buy + Auto Trade` หรือ `Auto Trade Only`
+6. กด `START BOT`
+7. ระหว่างรันให้ดู `Decision`, `Risk Status`, `Real-Time P/L`, และ `Activity Log`
 
-| ปุ่ม | คำอธิบาย |
-|------|----------|
-| 🧠 Train AI | Train โมเดล AI (LSTM + RL) จากข้อมูลจริง |
-| 📊 Backtest | ทดสอบกลยุทธ์ย้อนหลัง |
-| 🔄 Refresh | รีเฟรชข้อมูลราคาและ Indicators |
+### 5. Paper Trading
 
----
-
-## 🧠 ระบบ AI
-
-### LSTM Price Prediction
-
-- ใช้ Long Short-Term Memory (LSTM) neural network
-- พยากรณ์ทิศทางราคา (ขึ้น/ลง) พร้อม confidence
-- Input: ราคา OHLCV + Technical Indicators 60 แท่งย้อนหลัง
-
-### RL Trading Agent (DQN)
-
-- ใช้ Deep Q-Network เรียนรู้กลยุทธ์การเทรด
-- ตัดสินใจ BUY / SELL / HOLD โดยอัตโนมัติ
-- เรียนรู้จากข้อมูลจริงและปรับตัวตามตลาด
-
-### วิธี Train AI
+เปิดจาก GUI หรือ env vars:
 
 ```powershell
-python main.py train
+$env:PAPER_TRADE_ENABLED = "true"
+$env:PAPER_TRADE_START_BALANCE_THB = "1000"
 ```
 
-หรือกดปุ่ม **🧠 Train AI** ใน GUI
+เมื่อเปิดแล้ว:
 
-Bot จะ:
-1. ดึงข้อมูลราคาย้อนหลัง 1000 แท่ง (1h timeframe)
-2. คำนวณ Technical Indicators
-3. Train LSTM model สำหรับพยากรณ์ราคา
-4. Train RL agent สำหรับตัดสินใจซื้อขาย
-5. บันทึก model ที่ `ai_model/saved/`
+- จะไม่ส่งคำสั่งจริงไป Bitkub
+- ใช้ยอดเงินจำลองแยกจาก wallet จริง
+- position จำลองจะไม่ไปปะปนกับ holding จริง
 
-### ปรับแต่ง AI
-
-แก้ไขใน `config.py` → `AIConfig`:
-
-```python
-@dataclass
-class AIConfig:
-    lstm_sequence_length: int = 60    # จำนวน time steps ย้อนหลัง
-    lstm_hidden_size: int = 128       # LSTM hidden units
-    lstm_num_layers: int = 2          # จำนวน LSTM layers
-    lstm_epochs: int = 50             # จำนวน training epochs
-    lstm_batch_size: int = 32         # Batch size
-    lstm_learning_rate: float = 0.001 # Learning rate
-
-    rl_episodes: int = 1000           # RL training episodes
-    rl_learning_rate: float = 0.0003  # RL learning rate
-    rl_gamma: float = 0.99            # Discount factor
-```
-
----
-
-## ⚙️ ระบบการทำงาน
-
-### Auto Trading Loop (ทุก 30 วินาที)
-
-```
-1. ดึงราคาจาก Bitkub API
-2. คำนวณ Technical Indicators (RSI, MACD, BB, EMA)
-3. AI วิเคราะห์ (LSTM prediction)
-4. [Boss Mode ON] → ตรวจ CutLoss / Re-Buy
-   [Boss Mode OFF] → ตรวจ Stop Loss / Take Profit
-5. ตรวจสอบสัญญาณ BUY / SELL signals
-6. ส่งคำสั่งซื้อ/ขายผ่าน API (ถ้ามี signal)
-7. อัพเดท Real-Time P/L + GUI
-```
-
-### เงื่อนไข BUY (Auto)
-
-| Condition | Threshold |
-|-----------|-----------|
-| RSI | < 35 (oversold) |
-| Price vs EMA | ราคาต่ำกว่า EMA 21 |
-| AI Prediction | ทิศทางขึ้น + confidence > 30% |
-| MACD (bonus) | Bullish crossover |
-| BB (bonus) | ราคาต่ำกว่า Bollinger lower band |
-
-*ต้องผ่าน 2 ใน 3 เงื่อนไขหลักถึงจะ BUY*
-
-### เงื่อนไข SELL (Auto)
-
-| Condition | Threshold |
-|-----------|-----------|
-| RSI | > 70 (overbought) |
-| Price vs BB | ราคาสูงกว่า Bollinger upper band |
-| AI Prediction | ทิศทางลง + confidence > 30% |
-| MACD (bonus) | Bearish crossover |
-
-*ต้องผ่าน 2 ใน 3 เงื่อนไขหลักถึงจะ SELL*
-
-### โหมดการทำงาน
-
-| โหมด | CutLoss | Re-Buy | Take Profit |
-|------|---------|--------|-------------|
-| **Boss Mode ON** | -0.5% → ขาย, รอซื้อคืน +0.5% | อัตโนมัติ | ตาม TP% |
-| **Boss Mode OFF** | ตาม SL% (default -3%) | ไม่มี | ตาม TP% (default +5%) |
-
-### Risk Management
-
-| Parameter | Default |
-|-----------|---------|
-| Max Trade Size | 10,000 THB |
-| Max Daily Loss | 5,000 THB |
-| Max Position % | 30% ของ balance |
-| Max Open Positions | 3 |
-
----
-
-## 📊 Backtesting
+## Environment Variables ที่ใช้บ่อย
 
 ```powershell
-python main.py backtest
+$env:TRADING_SYMBOL = "BTC_THB"
+$env:STOP_LOSS_PCT = "1.4"
+$env:TAKE_PROFIT_PCT = "4.8"
+$env:PAPER_TRADE_ENABLED = "true"
+$env:PAPER_TRADE_START_BALANCE_THB = "1000"
+$env:BUY_FEE_RATE = "0.0027"
+$env:SELL_FEE_RATE = "0.0027"
+
+$env:MAX_TRADE_SIZE_THB = "7000"
+$env:MAX_POSITION_PCT = "16"
+$env:MAX_DAILY_LOSS_THB = "3000"
+$env:MAX_DAILY_TRADES = "8"
+$env:CASH_RESERVE_PCT = "25"
+
+$env:DOWNTREND_POSITION_SCALE_PCT = "45"
+$env:HIGH_VOLATILITY_ATR_PCT = "2.2"
+$env:HIGH_VOLATILITY_POSITION_SCALE_PCT = "70"
+$env:DOWNTREND_PAUSE_LOSS_STREAK = "2"
+
+$env:LLM_ENABLED = "true"
+$env:OPENAI_API_KEY = "<your_openai_api_key>"
+$env:LLM_MODEL = "gpt-4.1-mini"
 ```
 
-หรือกดปุ่ม **📊 Backtest** ใน GUI
+## หมายเหตุด้านกลยุทธ์
 
-ผลลัพธ์จะแสดง:
-- **Win Rate** — อัตราชนะ
-- **Total Return** — ผลตอบแทนรวม
-- **Max Drawdown** — การลดลงสูงสุด
-- **Sharpe Ratio** — อัตราส่วนผลตอบแทนต่อความเสี่ยง
-- **Profit Factor** — อัตราส่วนกำไรต่อขาดทุน
+- ระบบนี้ยังไม่ใช่ hedge strategy และไม่ได้ short ตลาด
+- เวลาตลาดลงแรง ระบบจะเน้น `ลดการเข้า`, `ลดไม้`, และ `รอ confirmation` มากกว่าฝืนซื้อถัว
+- backup stop loss ยังอยู่เพื่อกันกรณี AI ไม่ตอบสนองหรือสภาพตลาดผิดปกติ
+- ผลลัพธ์จริงขึ้นกับค่าธรรมเนียม, slippage, latency และคุณภาพของข้อมูลจาก exchange
 
----
+## คำแนะนำก่อนใช้เงินจริง
 
-## 💹 Real-Time P/L Display
-
-เมื่อ Bot ทำงาน จะแสดงข้อมูล real-time:
-
-| ข้อมูล | คำอธิบาย |
-|--------|----------|
-| Unrealized P/L (THB) | กำไร/ขาดทุนที่ยังไม่ได้ขาย (บาท) |
-| P/L % | เปอร์เซ็นต์กำไร/ขาดทุน |
-| Position Summary | รายละเอียด: เหรียญ, จำนวน, ราคาซื้อ → ราคาปัจจุบัน |
-
-- 🟢 **สีเขียว** = กำไร
-- 🔴 **สีแดง** = ขาดทุน
-
-อัพเดททุกรอบ (ตาม Interval ที่ตั้ง)
-
----
-
-## 📝 Logs
-
-Log files จะอยู่ในโฟลเดอร์ `logs/`:
-
-| File | Description |
-|------|-------------|
-| `trades.log` | บันทึกการซื้อขายทั้งหมด |
-| `errors.log` | บันทึก errors |
-| `ai_predictions.log` | บันทึก AI predictions |
-
----
-
-## 🔒 ความปลอดภัย
-
-- API Key ไม่ถูกเก็บในโค้ด — ใส่ผ่าน GUI หรือ .env
-- ช่อง API Key/Secret แสดงเป็น •••• (กดปุ่ม 👁 เพื่อดู)
-- รองรับ Ctrl+V, คลิกขวา Paste, Ctrl+C/X/A
-- ใช้ HMAC-SHA256 (v3) สำหรับ sign API request
-- **ห้ามเปิดสิทธิ์ Withdraw ใน API Key**
-
----
-
-## ⚠️ คำเตือน
-
-- **Bot นี้ใช้เงินจริงในการเทรด** — ทดสอบด้วย backtest ก่อนเสมอ
-- **ไม่มีการรับประกันกำไร** — Crypto มีความผันผวนสูง
-- **ตั้ง Stop Loss เสมอ** — เพื่อจำกัดความเสียหาย
-- **อย่าใช้เงินที่ไม่พร้อมจะเสีย**
-- **ตรวจสอบ API Key permissions** — เปิดเฉพาะ Read + Trade, ไม่เปิด Withdraw
-- **Boss Mode เหมาะสำหรับตลาด Sideway** — ตลาด Downtrend อาจ cutloss ซ้ำหลายรอบ
-
----
-
-## 📜 License
-
-MIT License
+1. เริ่มจาก `paper trading` ก่อน
+2. ปรับ `Auto Buy`, `MAX_TRADE_SIZE_THB`, และ `MAX_POSITION_PCT` ให้เหมาะกับขนาดพอร์ต
+3. ดูแผง `Risk Status` ว่าระบบกำลังลดไม้จากเหตุผลอะไรบ้าง
+4. ถ้าตลาดแกว่งแรงผิดปกติ ให้ลด symbol scope หรือเพิ่ม interval ก่อน

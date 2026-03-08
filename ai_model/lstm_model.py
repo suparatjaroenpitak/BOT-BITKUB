@@ -212,6 +212,10 @@ class LSTMPredictor:
                     f"Train Loss: {avg_train_loss:.6f} | Val Loss: {val_loss:.6f}"
                 )
 
+        # Keep the in-memory predictor aligned with the persisted best checkpoint.
+        if os.path.exists(self.config.lstm_model_path):
+            self.load_model(df)
+
         self.logger.log_info(f"LSTM training complete. Best Val Loss: {best_val_loss:.6f}")
         return history
 

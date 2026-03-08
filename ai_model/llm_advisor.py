@@ -23,6 +23,7 @@ class LLMBossAdvisor:
         self.last_request_at = 0.0
         self.last_cache_key = ""
         self.last_response: Dict[str, Any] = {}
+        self.disabled_until = 0.0
 
         if self.is_enabled() and OpenAI is not None:
             try:
@@ -47,6 +48,8 @@ class LLMBossAdvisor:
             "action": "HOLD" if stage not in {"recovery", "entry"} else ("WAIT" if stage == "recovery" else "SKIP"),
             "confidence": 0.0,
             "reason": "LLM advisor unavailable",
+            "status": "unavailable",
+            "error_code": "unavailable",
             "cutloss_pct": None,
             "recovery_pct": None,
             "allocation_pct": None,
@@ -62,6 +65,12 @@ class LLMBossAdvisor:
         cache_key = json.dumps({"stage": stage, "context": context}, sort_keys=True, ensure_ascii=True, default=str)
         interval = max(getattr(self.config, "llm_request_interval_seconds", 20), 0)
         now = time.time()
+        if self.disabled_until > now:
+            cached_error = dict(self.last_response) if self.last_response else dict(fallback)
+            cached_error["used"] = False
+            cached_error["status"] = "backoff"
+            cached_error["reason"] = cached_error.get("reason", "LLM temporarily paused")
+            return cached_error
         if cache_key == self.last_cache_key and self.last_response:
             return self.last_response
         if self.last_response and now - self.last_request_at < interval:
@@ -110,6 +119,8 @@ class LLMBossAdvisor:
                 "action": parsed.get("action", fallback["action"]),
                 "confidence": float(parsed.get("confidence", 0.0) or 0.0),
                 "reason": str(parsed.get("reason", "LLM response parsed"))[:140],
+                "status": "ok",
+                "error_code": "",
                 "cutloss_pct": self._normalize_optional_float(
                     parsed.get("cutloss_pct"),
                     self.trading_config.adaptive_cutloss_floor_pct,
@@ -130,10 +141,19 @@ class LLMBossAdvisor:
             self.last_request_at = now
             self.last_cache_key = cache_key
             self.last_response = result
+            self.disabled_until = 0.0
             return result
         except Exception as error:
             self.logger.log_error("LLM boss advisor", error)
-            fallback["reason"] = f"LLM error: {error}"
+            error_info = self._classify_error(error)
+            fallback["reason"] = error_info["reason"]
+            fallback["status"] = error_info["status"]
+            fallback["error_code"] = error_info["code"]
+            fallback["raw"] = str(error)
+            self.disabled_until = now + error_info["retry_after_seconds"]
+            self.last_request_at = now
+            self.last_cache_key = cache_key
+            self.last_response = dict(fallback)
             return fallback
 
     def review_boss_action(self, stage: str, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -161,3 +181,43 @@ class LLMBossAdvisor:
             return _clamp(float(value), minimum, maximum)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _classify_error(error: Exception) -> Dict[str, Any]:
+        text = str(error)
+        normalized = text.lower()
+
+        if "insufficient_quota" in normalized or "quota" in normalized:
+            return {
+                "status": "quota",
+                "code": "insufficient_quota",
+                "reason": "LLM quota exceeded",
+                "retry_after_seconds": 300,
+            }
+        if "invalid_api_key" in normalized or "incorrect api key" in normalized or "401" in normalized:
+            return {
+                "status": "auth",
+                "code": "invalid_api_key",
+                "reason": "LLM invalid API key",
+                "retry_after_seconds": 300,
+            }
+        if "rate limit" in normalized or "429" in normalized:
+            return {
+                "status": "rate_limit",
+                "code": "rate_limit",
+                "reason": "LLM rate limited",
+                "retry_after_seconds": 90,
+            }
+        if "timeout" in normalized:
+            return {
+                "status": "timeout",
+                "code": "timeout",
+                "reason": "LLM timeout",
+                "retry_after_seconds": 45,
+            }
+        return {
+            "status": "error",
+            "code": "error",
+            "reason": "LLM unavailable",
+            "retry_after_seconds": 60,
+        }

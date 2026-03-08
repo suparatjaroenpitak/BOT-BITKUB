@@ -16,6 +16,8 @@ class Position:
     side: str  # "long"
     entry_price: float
     amount: float
+    entry_cost_thb: float = 0.0
+    entry_fee_thb: float = 0.0
     entry_time: datetime = field(default_factory=datetime.now)
     stop_loss_price: float = 0.0
     take_profit_price: float = 0.0
@@ -23,7 +25,7 @@ class Position:
 
     @property
     def value(self) -> float:
-        return self.entry_price * self.amount
+        return self.entry_cost_thb if self.entry_cost_thb > 0 else self.entry_price * self.amount
 
 
 class TradingStrategy:
@@ -39,6 +41,36 @@ class TradingStrategy:
     def _clamp(value: float, minimum: float, maximum: float) -> float:
         """Clamp a float between two bounds."""
         return max(minimum, min(value, maximum))
+
+    def _get_buy_fee_rate(self) -> float:
+        return max(float(getattr(self.config, "buy_fee_rate", 0.0027) or 0.0), 0.0)
+
+    def _get_sell_fee_rate(self) -> float:
+        return max(float(getattr(self.config, "sell_fee_rate", 0.0027) or 0.0), 0.0)
+
+    def estimate_entry_cost_thb(self, entry_price: float, amount: float) -> float:
+        """Estimate the total THB spent to open a position including buy fees."""
+        if entry_price <= 0 or amount <= 0:
+            return 0.0
+        buy_fee_rate = self._get_buy_fee_rate()
+        fee_denominator = max(1.0 - buy_fee_rate, 1e-9)
+        return float(entry_price) * float(amount) / fee_denominator
+
+    def estimate_exit_value_thb(self, amount: float, exit_price: float) -> float:
+        """Estimate net THB received after sell fees."""
+        if amount <= 0 or exit_price <= 0:
+            return 0.0
+        gross_exit = float(amount) * float(exit_price)
+        return gross_exit * (1.0 - self._get_sell_fee_rate())
+
+    def get_required_exit_price(self, position: Position, target_profit_pct: float = 0.0) -> float:
+        """Price required to achieve a target net P/L percentage after fees."""
+        if position.amount <= 0:
+            return 0.0
+        entry_cost = position.entry_cost_thb if position.entry_cost_thb > 0 else self.estimate_entry_cost_thb(position.entry_price, position.amount)
+        target_value = entry_cost * (1 + float(target_profit_pct or 0.0) / 100)
+        fee_denominator = max(position.amount * (1.0 - self._get_sell_fee_rate()), 1e-9)
+        return target_value / fee_denominator
 
     def _evaluate_buy_zone(self, signals: Dict, ai_prediction: Dict) -> Dict:
         """Check whether price is inside a favorable auto-buy accumulation zone."""
@@ -139,11 +171,31 @@ class TradingStrategy:
             resistance_level > 0
             and price >= resistance_level * (1 + self.config.resistance_breakout_pct / 100)
         )
+        price_reclaimed_ema9 = price >= ema_9 > 0
+        recovery_volume_ok = volume_ratio >= max(
+            self.config.min_volume_ratio,
+            self.config.downtrend_recovery_min_volume_ratio,
+        )
+        ai_recovery_ready = (
+            ai_direction == "up"
+            and ai_confidence >= self.config.downtrend_recovery_min_ai_confidence
+            and ai_change_pct >= 0.15
+        )
+        downtrend_recovery_ready = (
+            trend_down
+            and near_support
+            and signals.get("macd_bullish", False)
+            and price_reclaimed_ema9
+            and recovery_volume_ok
+            and ai_recovery_ready
+            and rsi <= self.config.downtrend_rsi_ceiling
+        )
         strong_reversal = (
             rsi <= max(self.config.rsi_buy_threshold - 4, 20)
             and signals.get("macd_bullish", False)
             and ai_direction == "up"
             and ai_confidence >= self.config.strong_ai_buy_confidence
+            and recovery_volume_ok
         )
         uptrend_pullback = (
             (trend_up or trend_soft_up)
@@ -159,12 +211,14 @@ class TradingStrategy:
         )
         counter_trend_reversal = (
             trend_down
-            and near_support
             and strong_reversal
+            and downtrend_recovery_ready
             and ai_confidence >= self.config.reversal_buy_min_ai_confidence
             and trend_gap_pct <= self.config.reversal_buy_max_trend_gap_pct
         )
         dip_buy = (
+            not trend_down
+            and
             (
                 price < ema_21
                 or signals.get("price_below_bb_lower", False)
@@ -182,7 +236,8 @@ class TradingStrategy:
             )
         )
         trend_buy = (
-            (trend_up or trend_soft_up or ai_change_pct > 0)
+            not trend_down
+            and (trend_up or trend_soft_up or ai_change_pct > 0)
             and (
                 ai_direction == "up"
                 or ai_confidence >= self.config.trend_buy_min_ai_confidence
@@ -266,6 +321,10 @@ class TradingStrategy:
             score += 0.95
             reasons.append("Counter-trend reversal allowed: strong AI rebound from support")
 
+        if downtrend_recovery_ready:
+            score += 0.55
+            reasons.append("Downtrend recovery confirmation passed: price reclaimed EMA9 with strong volume")
+
         if volume_ratio >= self.config.min_volume_ratio:
             score += 0.35
             reasons.append(f"Volume support confirmed ({volume_ratio:.2f}x)")
@@ -274,8 +333,8 @@ class TradingStrategy:
             reasons.append(f"Volume too light ({volume_ratio:.2f}x), skipping weak setup")
 
         if trend_down and not (dip_buy or counter_trend_reversal):
-            score -= 0.9
-            reasons.append("Downtrend remains active, so AI only allows dip accumulation near support")
+            score -= 1.15
+            reasons.append("Downtrend protection active: waiting for EMA9 reclaim, bullish MACD, and strong AI volume confirmation")
 
         valid_entry_setup = (
             dip_buy
@@ -305,6 +364,7 @@ class TradingStrategy:
             "near_support": near_support,
             "breakout_resistance": breakout_resistance,
             "counter_trend_reversal": counter_trend_reversal,
+            "downtrend_protection_active": trend_down and not counter_trend_reversal,
         }
 
     def should_sell(self, signals: Dict, ai_prediction: Dict,
@@ -412,14 +472,26 @@ class TradingStrategy:
             "extended_rally_sell": extended_rally_sell,
         }
 
-    @staticmethod
-    def get_position_pnl(position: Position, current_price: float) -> Dict[str, float]:
-        """Calculate current P/L for a position."""
-        profit_pct = (current_price - position.entry_price) / position.entry_price * 100
-        profit_thb = (current_price - position.entry_price) * position.amount
+    def get_position_pnl(self, position: Position, current_price: float,
+                         net_exit_value_thb: Optional[float] = None) -> Dict[str, float]:
+        """Calculate net P/L for a position after buy/sell fees."""
+        entry_cost = position.entry_cost_thb if position.entry_cost_thb > 0 else self.estimate_entry_cost_thb(position.entry_price, position.amount)
+        gross_exit_value = float(position.amount) * float(current_price) if current_price > 0 else 0.0
+        net_exit_value = float(net_exit_value_thb) if net_exit_value_thb is not None else self.estimate_exit_value_thb(position.amount, current_price)
+        sell_fee_thb = max(gross_exit_value - net_exit_value, 0.0)
+        profit_thb = net_exit_value - entry_cost
+        profit_pct = (profit_thb / entry_cost * 100) if entry_cost > 0 else 0.0
+        effective_entry_price = (entry_cost / position.amount) if position.amount > 0 else position.entry_price
+        break_even_exit_price = self.get_required_exit_price(position, 0.0)
         return {
             "profit_pct": profit_pct,
             "profit_thb": profit_thb,
+            "entry_cost_thb": entry_cost,
+            "gross_exit_value_thb": gross_exit_value,
+            "net_exit_value_thb": net_exit_value,
+            "sell_fee_thb": sell_fee_thb,
+            "effective_entry_price": effective_entry_price,
+            "break_even_exit_price": break_even_exit_price,
         }
 
     def get_adaptive_risk_profile(self, signals: Dict, ai_prediction: Dict,
@@ -854,7 +926,7 @@ class TradingStrategy:
 
         position.highest_price = max(position.highest_price, current_price)
 
-        base_stop = position.entry_price * (1 - self.config.stop_loss_pct / 100)
+        base_stop = self.get_required_exit_price(position, -self.config.stop_loss_pct)
         if position.stop_loss_price <= 0:
             position.stop_loss_price = base_stop
 
@@ -862,7 +934,7 @@ class TradingStrategy:
         pnl = self.get_position_pnl(position, current_price)
 
         if pnl["profit_pct"] >= self.config.break_even_trigger_pct:
-            break_even_stop = position.entry_price * (1 + self.config.break_even_buffer_pct / 100)
+            break_even_stop = self.get_required_exit_price(position, self.config.break_even_buffer_pct)
             dynamic_stop = max(dynamic_stop, break_even_stop)
 
         if self.config.trailing_stop_enabled and pnl["profit_pct"] >= self.config.trailing_stop_trigger_pct:
@@ -872,11 +944,8 @@ class TradingStrategy:
         position.stop_loss_price = dynamic_stop
 
         if current_price <= position.stop_loss_price:
-            loss_pct = (
-                (current_price - position.entry_price) / position.entry_price * 100
-            )
             self.logger.log_stop_loss(
-                position.symbol, position.entry_price, current_price, abs(loss_pct)
+                position.symbol, position.entry_price, current_price, abs(pnl["profit_pct"])
             )
             return True
         return False
@@ -884,54 +953,63 @@ class TradingStrategy:
     def check_take_profit(self, position: Position, current_price: float) -> bool:
         """Check if take profit should be triggered."""
         if position.take_profit_price <= 0:
-            # Calculate from config
-            position.take_profit_price = position.entry_price * (
-                1 + self.config.take_profit_pct / 100
-            )
+            position.take_profit_price = self.get_required_exit_price(position, self.config.take_profit_pct)
 
         if current_price >= position.take_profit_price:
-            profit_pct = (
-                (current_price - position.entry_price) / position.entry_price * 100
-            )
+            profit_pct = self.get_position_pnl(position, current_price)["profit_pct"]
             self.logger.log_take_profit(
                 position.symbol, position.entry_price, current_price, profit_pct
             )
             return True
         return False
 
-    def add_position(self, symbol: str, entry_price: float, amount: float) -> Position:
+    def add_position(self, symbol: str, entry_price: float, amount: float,
+                     cost_thb: Optional[float] = None,
+                     entry_fee_thb: Optional[float] = None) -> Position:
         """Add a new position."""
-        sl_price = entry_price * (1 - self.config.stop_loss_pct / 100)
-        tp_price = entry_price * (1 + self.config.take_profit_pct / 100)
+        estimated_cost = float(cost_thb) if cost_thb is not None else self.estimate_entry_cost_thb(entry_price, amount)
+        estimated_fee = float(entry_fee_thb) if entry_fee_thb is not None else max(estimated_cost - (entry_price * amount), 0.0)
 
         position = Position(
             symbol=symbol,
             side="long",
             entry_price=entry_price,
             amount=amount,
-            stop_loss_price=sl_price,
-            take_profit_price=tp_price,
+            entry_cost_thb=estimated_cost,
+            entry_fee_thb=estimated_fee,
             highest_price=entry_price,
         )
+        position.stop_loss_price = self.get_required_exit_price(position, -self.config.stop_loss_pct)
+        position.take_profit_price = self.get_required_exit_price(position, self.config.take_profit_pct)
         self.positions.append(position)
 
         self.logger.log_info(
             f"Position opened: {symbol} @ {entry_price:.2f} | "
-            f"Amount: {amount:.8f} | SL: {sl_price:.2f} | TP: {tp_price:.2f}"
+            f"Amount: {amount:.8f} | Cost: {estimated_cost:.2f} THB | "
+            f"Fee: {estimated_fee:.2f} THB | SL: {position.stop_loss_price:.2f} | TP: {position.take_profit_price:.2f}"
         )
         return position
 
-    def close_position(self, position: Position, exit_price: float, reason: str = ""):
+    def close_position(self, position: Position, exit_price: float, reason: str = "",
+                       net_exit_value_thb: Optional[float] = None,
+                       sell_fee_thb: Optional[float] = None):
         """Close a position and record it."""
-        pnl = self.get_position_pnl(position, exit_price)
+        pnl = self.get_position_pnl(position, exit_price, net_exit_value_thb=net_exit_value_thb)
         profit_pct = pnl["profit_pct"]
         profit_thb = pnl["profit_thb"]
+        resolved_sell_fee = float(sell_fee_thb) if sell_fee_thb is not None else pnl["sell_fee_thb"]
 
         trade_record = {
             "symbol": position.symbol,
             "entry_price": position.entry_price,
+            "entry_cost_thb": pnl["entry_cost_thb"],
+            "entry_fee_thb": position.entry_fee_thb,
             "exit_price": exit_price,
             "amount": position.amount,
+            "gross_exit_value_thb": pnl["gross_exit_value_thb"],
+            "net_exit_value_thb": pnl["net_exit_value_thb"],
+            "sell_fee_thb": resolved_sell_fee,
+            "total_fee_thb": position.entry_fee_thb + resolved_sell_fee,
             "profit_pct": profit_pct,
             "profit_thb": profit_thb,
             "entry_time": position.entry_time.isoformat(),
@@ -945,7 +1023,7 @@ class TradingStrategy:
 
         self.logger.log_trade(
             "SELL", position.symbol, exit_price, position.amount,
-            f"{reason} | P/L: {profit_pct:.2f}%"
+            f"{reason} | Net P/L: {profit_pct:.2f}% | Fees: {position.entry_fee_thb + resolved_sell_fee:.2f} THB"
         )
         return trade_record
 

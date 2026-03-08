@@ -18,6 +18,7 @@ from exchange.data_collector import MarketDataCollector
 from strategy.indicators import TechnicalIndicatorEngine
 from strategy.trading_strategy import TradingStrategy
 from strategy.risk_management import RiskManager
+from ai_model.llm_advisor import LLMBossAdvisor
 from ai_model.lstm_model import LSTMPredictor
 from ai_model.rl_model import RLTradingAgent, TradingEnvironment
 from backtest.backtester import Backtester
@@ -42,10 +43,27 @@ class TradingBot:
         self.risk_manager = RiskManager(config.risk, self.logger)
         self.lstm_predictor = LSTMPredictor(config.ai, self.logger)
         self.rl_agent = RLTradingAgent(config.ai, logger=self.logger)
+        self.llm_boss_advisor = LLMBossAdvisor(config.ai, config.trading, self.logger)
         self.dashboard = TradingDashboard(self.strategy, self.risk_manager)
 
         self.running = False
         self.cycle_count = 0
+        self.last_trade_llm_advice: Dict = {}
+        self.paper_trade_enabled = bool(config.trading.paper_trade_enabled)
+        self.paper_balance_thb = float(config.trading.paper_trade_start_balance_thb or 0.0)
+
+    def _resolve_paper_start_balance(self, live_balance: float = 0.0) -> float:
+        """Resolve the simulated starting THB balance."""
+        configured_balance = float(self.config.trading.paper_trade_start_balance_thb or 0.0)
+        if configured_balance > 0:
+            return configured_balance
+        return max(float(live_balance or 0.0), 0.0)
+
+    def _ensure_paper_balance(self, live_balance: float = 0.0, force_reset: bool = False) -> float:
+        """Initialize the paper wallet when needed."""
+        if force_reset or self.paper_balance_thb <= 0:
+            self.paper_balance_thb = self._resolve_paper_start_balance(live_balance)
+        return self.paper_balance_thb
 
     def start(self):
         """Start the auto trading loop."""
@@ -56,6 +74,7 @@ class TradingBot:
         self.logger.log_info(f"Interval: {self.config.trading.trading_interval_seconds}s")
         self.logger.log_info(f"Stop Loss: {self.config.trading.stop_loss_pct}%")
         self.logger.log_info(f"Take Profit: {self.config.trading.take_profit_pct}%")
+        self.logger.log_info(f"Mode: {'PAPER' if self.paper_trade_enabled else 'LIVE'}")
         self.logger.log_info("=" * 50)
 
         # Load AI models
@@ -64,6 +83,7 @@ class TradingBot:
         print("\n🤖 Bitkub Auto Trading Bot started!")
         print(f"   Symbol: {self.config.trading.symbol}")
         print(f"   Interval: {self.config.trading.trading_interval_seconds}s")
+        print(f"   Mode: {'PAPER' if self.paper_trade_enabled else 'LIVE'}")
         print("   Press Ctrl+C to stop\n")
 
         try:
@@ -117,9 +137,13 @@ class TradingBot:
             ai_prediction = self.lstm_predictor.predict(df_with_indicators)
 
             # Step 4: Get balance and check risk
-            balance = self.client.get_thb_balance()
+            live_balance = self.client.get_thb_balance()
+            if self.paper_trade_enabled:
+                balance = self._ensure_paper_balance(live_balance)
+            else:
+                balance = live_balance
             positions = self.strategy.get_open_positions(symbol)
-            risk_check = self.risk_manager.can_trade(balance, positions)
+            risk_check = self.risk_manager.can_trade(balance, positions, signals, ai_prediction)
 
             # Step 5: Check existing positions for SL/TP
             action_taken = self._check_positions(
@@ -140,10 +164,15 @@ class TradingBot:
                     {symbol: current_price},
                     signals,
                     ai_prediction,
+                    mode_label="PAPER" if self.paper_trade_enabled else "LIVE",
                 )
             else:
                 self.dashboard.print_compact_status(
-                    balance, current_price, symbol, action_name
+                    balance,
+                    current_price,
+                    symbol,
+                    action_name,
+                    mode_label="PAPER" if self.paper_trade_enabled else "LIVE",
                 )
 
         except Exception as e:
@@ -161,6 +190,43 @@ class TradingBot:
         except Exception as e:
             self.logger.log_error("RL live decision", e)
             return {}
+
+    def _request_trade_llm_advice(self, stage: str, symbol: str, current_price: float,
+                                  balance: float, signals: Dict, ai_prediction: Dict,
+                                  position=None, reasons=None, signal_score: float = 0.0) -> Dict:
+        context = {
+            "symbol": symbol,
+            "current_price": round(float(current_price or 0.0), 8),
+            "balance_thb": round(float(balance or 0.0), 2),
+            "signal_score": round(float(signal_score or 0.0), 4),
+            "position_entry_price": round(float(position.entry_price), 8) if position else None,
+            "position_amount": round(float(position.amount), 8) if position else None,
+            "signals": {
+                "rsi": round(float(signals.get("rsi", 0.0) or 0.0), 2),
+                "trend_down": bool(signals.get("trend_down", False)),
+                "macd_bearish": bool(signals.get("macd_bearish", False)),
+                "support_level": round(float(signals.get("support_level", 0.0) or 0.0), 8),
+                "resistance_level": round(float(signals.get("resistance_level", 0.0) or 0.0), 8),
+            },
+            "ai": {
+                "direction": ai_prediction.get("direction", "unknown"),
+                "confidence": round(float(ai_prediction.get("confidence", 0.0) or 0.0), 4),
+                "price_change_pct": round(float(ai_prediction.get("price_change_pct", 0.0) or 0.0), 4),
+                "predicted_price": round(float(ai_prediction.get("predicted_price", 0.0) or 0.0), 8),
+            },
+            "reasons": reasons or [],
+        }
+        advice = self.llm_boss_advisor.review_trade_action(stage, context, {"stage": stage})
+        self.last_trade_llm_advice = advice
+        return advice
+
+    def _llm_is_confident(self, advice: Dict, expected_action: str) -> bool:
+        min_conf = float(getattr(self.config.ai, "llm_override_min_confidence", 0.68) or 0.68)
+        return (
+            advice.get("used")
+            and advice.get("action") == expected_action
+            and float(advice.get("confidence", 0.0) or 0.0) >= min_conf
+        )
 
     def _check_positions(self, symbol: str, current_price: float,
                          df_with_indicators: pd.DataFrame,
@@ -200,11 +266,30 @@ class TradingBot:
             sold_any = False
             for position in positions:
                 sell_decision = self.strategy.should_sell(signals, ai_prediction, position)
-                if not sell_decision["should_sell"]:
+                llm_sell_advice = self._request_trade_llm_advice(
+                    "exit",
+                    symbol,
+                    current_price,
+                    balance,
+                    signals,
+                    ai_prediction,
+                    position=position,
+                    reasons=sell_decision.get("reasons", []),
+                    signal_score=sell_decision.get("score", 0.0),
+                )
+                should_sell = sell_decision["should_sell"]
+                if self._llm_is_confident(llm_sell_advice, "HOLD"):
+                    should_sell = False
+                elif self._llm_is_confident(llm_sell_advice, "SELL"):
+                    should_sell = True
+
+                if not should_sell:
                     continue
                 trade_record = self._execute_sell(
                     position, current_price,
-                    "SELL_SIGNAL_TO_THB: " + "; ".join(sell_decision["reasons"])
+                    "SELL_SIGNAL_TO_THB: " + "; ".join(
+                        list(sell_decision["reasons"]) + ([f"LLM: {llm_sell_advice.get('reason', '')}"] if llm_sell_advice.get("used") else [])
+                    )
                 )
                 sold_any = sold_any or bool(trade_record)
             if sold_any:
@@ -213,15 +298,37 @@ class TradingBot:
         # Check BUY
         if not positions:
             buy_decision = self.strategy.should_buy(signals, ai_prediction)
-            if buy_decision["should_buy"]:
+            llm_buy_advice = self._request_trade_llm_advice(
+                "entry",
+                symbol,
+                current_price,
+                balance,
+                signals,
+                ai_prediction,
+                reasons=buy_decision.get("reasons", []),
+                signal_score=buy_decision.get("score", 0.0),
+            )
+            should_buy = buy_decision["should_buy"]
+            if self._llm_is_confident(llm_buy_advice, "SKIP"):
+                should_buy = False
+            elif self._llm_is_confident(llm_buy_advice, "BUY"):
+                should_buy = True
+
+            if should_buy:
                 # Calculate position size
                 sizing = self.risk_manager.calculate_position_size(
-                    balance, current_price, buy_decision["signal_strength"]
+                    balance,
+                    current_price,
+                    buy_decision["signal_strength"],
+                    signals,
+                    ai_prediction,
                 )
                 if sizing["position_size_thb"] >= 100:  # Min 100 THB
                     self._execute_buy(
                         symbol, sizing["position_size_thb"], current_price,
-                        "BUY_SIGNAL: " + "; ".join(buy_decision["reasons"])
+                        "BUY_SIGNAL: " + "; ".join(
+                            list(buy_decision["reasons"]) + ([f"LLM: {llm_buy_advice.get('reason', '')}"] if llm_buy_advice.get("used") else [])
+                        )
                     )
                     return "BUY"
 
@@ -232,6 +339,35 @@ class TradingBot:
         """Execute a buy order."""
         self.logger.log_trade("BUY", symbol, price, amount_thb / price, reason)
 
+        if self.paper_trade_enabled:
+            available_balance = self._ensure_paper_balance()
+            if amount_thb > available_balance:
+                self.logger.log_error(
+                    "execute_buy",
+                    Exception(
+                        f"Paper buy failed for {symbol}: insufficient simulated balance {available_balance:.2f} THB"
+                    ),
+                )
+                return None
+            buy_fee_rate = max(float(getattr(self.config.trading, "buy_fee_rate", 0.0027) or 0.0), 0.0)
+            crypto_amount = (amount_thb * (1 - buy_fee_rate)) / price if price else 0.0
+            self.paper_balance_thb = max(available_balance - amount_thb, 0.0)
+            self.strategy.add_position(
+                symbol,
+                price,
+                crypto_amount,
+                cost_thb=amount_thb,
+                entry_fee_thb=max(amount_thb - (price * crypto_amount), 0.0),
+            )
+            self.logger.log_info(
+                f"PAPER BUY executed: {symbol} @ {price:.2f} | remaining paper balance {self.paper_balance_thb:.2f}"
+            )
+            return {
+                "rate": price,
+                "amount": crypto_amount,
+                "paper": True,
+            }
+
         order = self.client.create_buy_order(symbol, amount_thb)
         if "_error" in order:
             self.logger.log_error(
@@ -240,10 +376,14 @@ class TradingBot:
             )
             return None
         if order:
-            buy_fee_rate = max(float(getattr(self.config.trading, "buy_fee_rate", 0.0027) or 0.0), 0.0)
-            crypto_amount = order.get("amount", (amount_thb * (1 - buy_fee_rate)) / price if price else 0.0)
+            crypto_amount = order.get("amount", amount_thb / price)
             executed_price = order.get("rate", price)
-            self.strategy.add_position(symbol, executed_price, crypto_amount)
+            self.strategy.add_position(
+                symbol,
+                executed_price,
+                crypto_amount,
+                cost_thb=float(order.get("cost", amount_thb) or amount_thb),
+            )
             self.logger.log_info(f"BUY executed: {symbol} @ {executed_price:.2f}")
             return order
         return None
@@ -258,6 +398,13 @@ class TradingBot:
                 f"Skipping sell for {position.symbol}: remaining value {estimated_value:.2f} THB is below Bitkub minimum; position removed from bot tracking"
             )
             return None
+
+        if self.paper_trade_enabled:
+            trade_record = self.strategy.close_position(position, current_price, reason)
+            if trade_record:
+                self.paper_balance_thb += float(trade_record.get("net_exit_value_thb", 0.0) or 0.0)
+                self.risk_manager.record_trade_result(trade_record["profit_thb"])
+            return trade_record
 
         order = self.client.create_sell_order(position.symbol, position.amount)
         if "_error" in order:
@@ -277,7 +424,12 @@ class TradingBot:
         if order:
             exit_price = order.get("rate", current_price)
 
-        trade_record = self.strategy.close_position(position, exit_price, reason)
+        trade_record = self.strategy.close_position(
+            position,
+            exit_price,
+            reason,
+            net_exit_value_thb=float(order.get("received", 0.0) or 0.0),
+        )
         if trade_record:
             self.risk_manager.record_trade_result(trade_record["profit_thb"])
         return trade_record
@@ -310,7 +462,10 @@ class TradingBot:
         rl_history = self.rl_agent.train(df_with_indicators)
         print("✅ RL training complete")
 
-        print("\n🎉 All AI models trained and saved!")
+        self.lstm_predictor.load_model(df_with_indicators)
+        self.rl_agent.load_model()
+
+        print("\n🎉 All AI models trained, saved, and reloaded for future auto trade!")
 
     def run_backtest(self):
         """Run backtesting on historical data."""
@@ -345,6 +500,7 @@ def parse_args():
     parser.add_argument("--interval", type=int, default=30, help="Trading interval (seconds)")
     parser.add_argument("--sl", type=float, help="Stop loss percentage")
     parser.add_argument("--tp", type=float, help="Take profit percentage")
+    parser.add_argument("--paper", action="store_true", help="Run in paper trading mode")
     return parser.parse_args()
 
 
@@ -363,6 +519,7 @@ def main():
     config = AppConfig.from_env()
     config.trading.symbol = args.symbol
     config.trading.trading_interval_seconds = args.interval
+    config.trading.paper_trade_enabled = bool(config.trading.paper_trade_enabled or args.paper)
 
     if args.sl:
         config.trading.stop_loss_pct = args.sl
@@ -370,7 +527,11 @@ def main():
         config.trading.take_profit_pct = args.tp
 
     # Validate API keys for live trading
-    if args.mode == "trade" and (not config.bitkub.api_key or not config.bitkub.api_secret):
+    if (
+        args.mode == "trade"
+        and not config.trading.paper_trade_enabled
+        and (not config.bitkub.api_key or not config.bitkub.api_secret)
+    ):
         print("❌ Error: BITKUB_API_KEY and BITKUB_API_SECRET environment variables required")
         print("   Set them with:")
         print('   $env:BITKUB_API_KEY = "your_api_key"')
@@ -389,12 +550,14 @@ def main():
     elif args.mode == "dashboard":
         # Single dashboard display
         try:
-            balance = bot.client.get_thb_balance()
+            live_balance = bot.client.get_thb_balance()
+            balance = bot._ensure_paper_balance(live_balance) if bot.paper_trade_enabled else live_balance
             ticker = bot.data_collector.fetch_ticker()
             current_price = ticker.get("last", 0)
             bot.dashboard.display(
                 balance,
                 {config.trading.symbol: current_price},
+                mode_label="PAPER" if bot.paper_trade_enabled else "LIVE",
             )
         except Exception as e:
             print(f"❌ Error: {e}")

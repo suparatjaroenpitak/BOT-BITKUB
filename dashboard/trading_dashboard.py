@@ -17,11 +17,12 @@ class TradingDashboard:
         self.risk_manager = risk_manager
 
     def display(self, balance: float, current_prices: Dict[str, float],
-                signals: Optional[Dict] = None, ai_prediction: Optional[Dict] = None):
+                signals: Optional[Dict] = None, ai_prediction: Optional[Dict] = None,
+                mode_label: str = "LIVE"):
         """Display the full dashboard."""
         self._clear_screen()
-        self._print_header()
-        self._print_balance(balance, current_prices)
+        self._print_header(mode_label)
+        self._print_balance(balance, current_prices, mode_label)
         self._print_positions(current_prices)
         self._print_risk_status(balance)
         if signals:
@@ -35,16 +36,17 @@ class TradingDashboard:
         """Clear terminal screen."""
         os.system("cls" if os.name == "nt" else "clear")
 
-    def _print_header(self):
+    def _print_header(self, mode_label: str):
         """Print dashboard header."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print()
         print("╔" + "═" * 70 + "╗")
         print("║" + "  🤖 BITKUB AUTO TRADING BOT - DASHBOARD".center(70) + "║")
         print("║" + f"  {now}".center(70) + "║")
+        print("║" + f"  MODE: {mode_label}".center(70) + "║")
         print("╠" + "═" * 70 + "╣")
 
-    def _print_balance(self, balance: float, current_prices: Dict[str, float]):
+    def _print_balance(self, balance: float, current_prices: Dict[str, float], mode_label: str):
         """Print balance information."""
         total_value = balance
         for pos in self.strategy.positions:
@@ -52,7 +54,8 @@ class TradingDashboard:
             total_value += pos.amount * price
 
         print("║" + "  💰 BALANCE".ljust(70) + "║")
-        print("║" + f"    THB Balance:    {balance:>15,.2f} THB".ljust(70) + "║")
+        balance_label = "Paper Balance" if mode_label == "PAPER" else "THB Balance"
+        print("║" + f"    {balance_label}:  {balance:>15,.2f} THB".ljust(70) + "║")
         print("║" + f"    Total Value:    {total_value:>15,.2f} THB".ljust(70) + "║")
         print("╠" + "═" * 70 + "╣")
 
@@ -154,7 +157,8 @@ class TradingDashboard:
         print()
 
     def print_compact_status(self, balance: float, current_price: float,
-                             symbol: str, action: str = "HOLD"):
+                             symbol: str, action: str = "HOLD",
+                             mode_label: str = "LIVE"):
         """Print a compact one-line status update."""
         positions = self.strategy.get_open_positions()
         total_value = balance
@@ -167,7 +171,7 @@ class TradingDashboard:
 
         print(
             f"[{now}] {symbol} @ {current_price:,.2f} | "
-            f"Balance: {balance:,.2f} | "
+            f"{mode_label} Balance: {balance:,.2f} | "
             f"Value: {total_value:,.2f} | "
             f"P/L: {sign}{pnl:,.2f} | "
             f"Positions: {len(positions)} | "

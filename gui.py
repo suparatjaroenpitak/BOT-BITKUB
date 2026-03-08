@@ -4,6 +4,7 @@ Bitkub Trading Bot - GUI Dashboard (Tkinter)
 พร้อมปุ่มควบคุม Start/Stop bot, Train AI, Backtest
 """
 import os
+import re
 import sys
 import threading
 import time
@@ -18,6 +19,7 @@ from exchange.data_collector import MarketDataCollector
 from strategy.indicators import TechnicalIndicatorEngine
 from strategy.trading_strategy import TradingStrategy, Position
 from strategy.risk_management import RiskManager
+from ai_model.llm_advisor import LLMBossAdvisor
 from ai_model.lstm_model import LSTMPredictor
 from ai_model.rl_model import RLTradingAgent
 from backtest.backtester import Backtester
@@ -52,7 +54,7 @@ class TradingBotGUI:
         self.root.configure(bg=COLORS["bg"])
 
         # State
-        self.config = AppConfig()
+        self.config = AppConfig.from_env()
         self.bot_running = False
         self.bot_thread: Optional[threading.Thread] = None
         self.logger = TradeLogger("logs")
@@ -67,6 +69,7 @@ class TradingBotGUI:
         self.risk_manager = RiskManager(self.config.risk, self.logger)
         self.lstm_predictor = LSTMPredictor(self.config.ai, self.logger)
         self.rl_agent = RLTradingAgent(self.config.ai, logger=self.logger)
+        self.llm_boss_advisor = LLMBossAdvisor(self.config.ai, self.config.trading, self.logger)
 
         # Data variables
         self.current_price = tk.StringVar(value="0.00")
@@ -74,7 +77,7 @@ class TradingBotGUI:
         self.balance_thb = tk.StringVar(value="0.00 THB")
         self.total_value = tk.StringVar(value="0.00 THB")
         self.pnl_text = tk.StringVar(value="0.00 THB")
-        self.bot_status = tk.StringVar(value="⏹ Stopped")
+        self.bot_status = tk.StringVar(value="⏹ หยุดอยู่")
         self.rsi_val = tk.StringVar(value="-")
         self.macd_val = tk.StringVar(value="-")
         self.bb_val = tk.StringVar(value="-")
@@ -82,33 +85,54 @@ class TradingBotGUI:
         self.ai_direction = tk.StringVar(value="-")
         self.ai_confidence = tk.StringVar(value="-")
         self.ai_predicted = tk.StringVar(value="-")
+        self.llm_trade_enabled = tk.BooleanVar(value=bool(self.config.ai.llm_enabled))
+        self.paper_trade_enabled = tk.BooleanVar(value=bool(self.config.trading.paper_trade_enabled))
+        self.trade_llm_status = tk.StringVar(value="LLM trade: disabled")
+        self.boss_realtime_status = tk.StringVar(value="Boss: OFF")
+        self.boss_realtime_detail = tk.StringVar(value="รอข้อมูล realtime...")
+        self.boss_llm_status = tk.StringVar(value="LLM: disabled")
+        self.risk_regime_text = tk.StringVar(value="Market regime: waiting for data")
+        self.risk_guard_text = tk.StringVar(value="Position sizing: waiting for data")
+        self.ui_connect_state = tk.StringVar(value="ยังไม่ได้เชื่อมต่อ Exchange")
+        self.ui_mode_state = tk.StringVar(value="โหมด: LIVE")
+        self.ui_focus_state = tk.StringVar(value="ขั้นตอนถัดไป: เชื่อมต่อ API และโหลด wallet")
         self.cycle_count = 0
         self.wallet_balances: Dict[str, Dict] = {}  # detailed balances
         self.wallet_price_map: Dict[str, float] = {}
+        self.last_signals: Dict = {}
+        self.last_ai_prediction: Dict = {}
+        self.last_thb_balance = 0.0
+        self.last_boss_llm_advice: Dict = {}
+        self.last_trade_llm_advice: Dict = {}
         self.is_connected = False
         self.initial_portfolio_value = 0.0  # portfolio value when bot started
+        self.paper_balance_thb = float(self.config.trading.paper_trade_start_balance_thb or 0.0)
         self.realtime_pnl = tk.StringVar(value="0.00 THB")
         self.realtime_pnl_pct = tk.StringVar(value="0.00%")
         self.trade_amount_var = tk.StringVar(value="100")
 
         # Boss Mode state
         self.boss_mode = tk.BooleanVar(value=True)
-        self.boss_cutloss_pct_var = tk.StringVar(value="0.6")
-        self.boss_recovery_pct_var = tk.StringVar(value="0.8")
+        self.boss_cutloss_pct_var = tk.StringVar(value=f"{self.config.trading.ai_cutloss_min_loss_pct:.2f}")
+        self.boss_recovery_pct_var = tk.StringVar(value=f"{self.config.trading.adaptive_rebuy_floor_pct:.2f}")
         self.boss_last_sell_price = 0.0  # track price at which boss sold
         self.boss_recovery_low_price = 0.0
         self.boss_rebuy_budget_thb = 0.0
+        self.boss_recovery_sell_cycle = 0
+        self.boss_recovery_confirm_count = 0
         self.boss_waiting_recovery = False  # True = sold, waiting for price to recover before buy-back
 
         # Auto re-entry state
         self.auto_reentry_enabled = tk.BooleanVar(value=True)
-        self.reentry_rise_pct_var = tk.StringVar(value="0.5")
-        self.reentry_delay_pct_var = tk.StringVar(value="1.0")
+        self.reentry_rise_pct_var = tk.StringVar(value=f"{self.config.trading.adaptive_rebuy_floor_pct:.2f}")
+        self.reentry_delay_pct_var = tk.StringVar(value=f"{self.config.trading.adaptive_reentry_delay_floor_pct:.2f}")
         self.reentry_waiting = False
         self.reentry_symbol = ""
         self.reentry_last_exit_price = 0.0
         self.reentry_recovery_low_price = 0.0
         self.reentry_budget_thb = 0.0
+        self.reentry_sell_cycle = 0
+        self.reentry_confirm_count = 0
         self.reentry_last_reason = ""
 
         # Bot performance tracking
@@ -118,28 +142,48 @@ class TradingBotGUI:
         self.bot_win_trades = 0                 # winning trades
         self.bot_lose_trades = 0                # losing trades
         self.bot_last_action = tk.StringVar(value="—")
+        self.bot_decision_status = tk.StringVar(value="รอประเมินสัญญาณ...")
+        self.bot_decision_detail = tk.StringVar(value="ระบบจะแสดงเหตุผล BUY / HOLD / WAIT และราคาเป้าหมายที่นี่")
         self.bot_uptime_str = tk.StringVar(value="00:00:00")
         self.bot_cycles_str = tk.StringVar(value="0")
         self.bot_realized_pnl_str = tk.StringVar(value="0.00 THB")
         self.bot_total_pnl_str = tk.StringVar(value="0.00 THB")
         self.bot_winrate_str = tk.StringVar(value="— %")
         self.auto_trade_amount_var = tk.StringVar(value="100")
+        self.quick_buy_mode_var = tk.StringVar(value="manual_auto")
+        self.quick_buy_mode_hint = tk.StringVar(value="Manual Buy + Auto Trade: ซื้อทันทีแล้วให้บอทดูแล position ต่อ")
         self.ai_scale_in_enabled = tk.BooleanVar(value=True)
-        self.ai_scale_in_loss_pct_var = tk.StringVar(value="1.0")
+        self.ai_scale_in_loss_pct_var = tk.StringVar(value=f"{self.config.trading.ai_scale_in_loss_pct:.2f}")
         self.ai_take_profit_enabled = tk.BooleanVar(value=True)
-        self.ai_take_profit_pct_var = tk.StringVar(value="1.2")
+        self.ai_take_profit_pct_var = tk.StringVar(value=f"{self.config.trading.ai_take_profit_min_profit_pct:.2f}")
         self._runtime_settings_snapshot: Dict[str, object] = {}
         self._runtime_settings_invalid = False
         self._runtime_badges: Dict[str, tk.Label] = {}
         self._runtime_field_normalizers: Dict[str, object] = {}
+        self._ai_metric_labels: Dict[str, tk.Label] = {}
         self._connect_in_progress = False
         self._wallet_refresh_in_progress = False
         self._market_refresh_in_progress = False
         self._bot_start_in_progress = False
+        self._paper_toggle_guard = False
+        self._paper_trade_enabled_last = bool(self.paper_trade_enabled.get())
+        self._active_scroll_canvas: Optional[tk.Canvas] = None
+        self._mousewheel_handler_registered = False
+        self._ai_model_lock = threading.RLock()
+        self._ai_training_in_progress = False
+        self._trade_cycle_lock = threading.Lock()
+        self._runtime_apply_after_id = None
+        self._scroll_columns: Dict[str, tk.Canvas] = {}
+        self._collapsible_cards: Dict[str, Dict[str, object]] = {}
 
         self._build_ui()
         self._setup_runtime_badges()
         self._apply_styles()
+        self.llm_trade_enabled.trace_add("write", self._on_llm_trade_toggle)
+        self.paper_trade_enabled.trace_add("write", self._on_paper_trade_toggle)
+        self.quick_buy_mode_var.trace_add("write", self._on_quick_buy_mode_change)
+        self._sync_llm_trade_status_visual()
+        self._refresh_quick_buy_mode_ui()
 
     # ─── UI Construction ──────────────────────────────────────
 
@@ -157,32 +201,256 @@ class TradingBotGUI:
         body.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
         # Left panel (wider)
-        left = tk.Frame(body, bg=COLORS["bg"])
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        left_outer, left = self._create_scrollable_column(body, "left", width=0)
+        left_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # Right panel
-        right = tk.Frame(body, bg=COLORS["bg"], width=380)
-        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
-        right.pack_propagate(False)
+        right_outer, right = self._create_scrollable_column(body, "right", width=390)
+        right_outer.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
 
         # Left: Price + Bot Status + Wallet + Indicators + Positions + Log
         self._build_price_card(left)
         self._build_bot_status_card(left)
+        self._build_pnl_card(left)
         self._build_wallet_card(left)
         self._build_indicators_card(left)
         self._build_positions_card(left)
         self._build_log_card(left)
 
-        # Left: Real-time P/L card
-        self._build_pnl_card(left)
-
         # Right: API Settings + Quick Trade + AI + Controls + Trade History
+        self._build_quick_start_card(right)
         self._build_api_settings(right)
         self._build_quick_trade_card(right)
         self._build_ai_card(right)
         self._build_controls_card(right)
         self._build_risk_card(right)
         self._build_history_card(right)
+
+        self._refresh_quick_start_summary()
+
+    def _create_scrollable_column(self, parent, column_name: str, width: int = 0):
+        """Create a reusable scrollable column for dense dashboard sections."""
+        outer = tk.Frame(parent, bg=COLORS["bg"], width=width if width > 0 else 1)
+        if width > 0:
+            outer.pack_propagate(False)
+
+        toolbar = tk.Frame(outer, bg=COLORS["bg"], height=28)
+        toolbar.pack(fill=tk.X, pady=(0, 4))
+        toolbar.pack_propagate(False)
+
+        side_label = "LEFT PANEL" if column_name == "left" else "RIGHT PANEL"
+        tk.Label(
+            toolbar,
+            text=side_label,
+            font=("Segoe UI", 7, "bold"),
+            fg=COLORS["text_dim"],
+            bg=COLORS["bg"],
+        ).pack(side=tk.LEFT, padx=(2, 0))
+
+        tk.Button(
+            toolbar,
+            text="TOP",
+            font=("Segoe UI", 7, "bold"),
+            bg=COLORS["bg_input"],
+            fg=COLORS["text_bright"],
+            activebackground=COLORS["accent2"],
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=lambda name=column_name: self._scroll_column_to(name, "top"),
+        ).pack(side=tk.RIGHT, padx=(4, 0), ipady=1)
+
+        tk.Button(
+            toolbar,
+            text="BOTTOM",
+            font=("Segoe UI", 7, "bold"),
+            bg=COLORS["bg_input"],
+            fg=COLORS["text_bright"],
+            activebackground=COLORS["accent"],
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=lambda name=column_name: self._scroll_column_to(name, "bottom"),
+        ).pack(side=tk.RIGHT, ipady=1)
+
+        canvas = tk.Canvas(
+            outer,
+            bg=COLORS["bg"],
+            highlightthickness=0,
+            bd=0,
+            width=width if width > 0 else 1,
+        )
+        scrollbar = tk.Scrollbar(
+            outer,
+            orient=tk.VERTICAL,
+            command=canvas.yview,
+            width=15,
+            bg=COLORS["bg_input"],
+            activebackground=COLORS["accent"],
+            troughcolor=COLORS["bg_card"],
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=0,
+            elementborderwidth=0,
+        )
+        content = tk.Frame(canvas, bg=COLORS["bg"])
+
+        content.bind(
+            "<Configure>",
+            lambda event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(sidebar_window, width=event.width),
+        )
+
+        sidebar_window = canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas._linked_scroll_canvas = canvas
+        canvas._scroll_column_name = column_name
+        scrollbar._linked_scroll_canvas = canvas
+        content._linked_scroll_canvas = canvas
+        outer._linked_scroll_canvas = canvas
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        canvas.bind("<Enter>", lambda event, target=canvas: self._set_active_scroll_canvas(target))
+        canvas.bind("<Leave>", lambda event, target=canvas: self._clear_active_scroll_canvas(target))
+        content.bind("<Enter>", lambda event, target=canvas: self._set_active_scroll_canvas(target))
+        content.bind("<Leave>", lambda event, target=canvas: self._clear_active_scroll_canvas(target))
+        scrollbar.bind("<Enter>", lambda event, target=canvas: self._set_active_scroll_canvas(target))
+        scrollbar.bind("<Leave>", lambda event, target=canvas: self._clear_active_scroll_canvas(target))
+
+        if not self._mousewheel_handler_registered:
+            self.root.bind_all("<MouseWheel>", self._handle_global_mousewheel)
+            self.root.bind_all("<Shift-MouseWheel>", self._handle_shift_mousewheel)
+            self._mousewheel_handler_registered = True
+
+        self._scroll_columns[column_name] = canvas
+
+        return outer, content
+
+    def _scroll_column_to(self, column_name: str, target: str):
+        """Jump a named scrollable column to the top or bottom."""
+        canvas = self._scroll_columns.get(column_name)
+        if canvas is None:
+            return
+        canvas.yview_moveto(1.0 if target == "bottom" else 0.0)
+
+    def _set_active_scroll_canvas(self, canvas: tk.Canvas):
+        """Remember which scrollable column is currently under the pointer."""
+        self._active_scroll_canvas = canvas
+
+    def _clear_active_scroll_canvas(self, canvas: tk.Canvas):
+        """Clear the active scroll target when leaving a scrollable column."""
+        if self._active_scroll_canvas is canvas:
+            self._active_scroll_canvas = None
+
+    def _resolve_scroll_canvas_from_event(self, event) -> Optional[tk.Canvas]:
+        """Resolve the scrollable canvas currently under the pointer."""
+        widget = None
+        try:
+            widget = self.root.winfo_containing(event.x_root, event.y_root)
+        except tk.TclError:
+            widget = None
+
+        while widget is not None:
+            linked_canvas = getattr(widget, "_linked_scroll_canvas", None)
+            if linked_canvas is not None:
+                return linked_canvas
+            widget = getattr(widget, "master", None)
+
+        return self._active_scroll_canvas
+
+    @staticmethod
+    def _scroll_canvas(canvas: Optional[tk.Canvas], steps: int, mode: str = "units"):
+        """Scroll a canvas safely when a valid target exists."""
+        if canvas is None or steps == 0:
+            return
+        canvas.yview_scroll(steps, mode)
+
+    def _handle_global_mousewheel(self, event):
+        """Route mouse-wheel scrolling to the column currently under the cursor."""
+        if not event.delta:
+            return
+        canvas = self._resolve_scroll_canvas_from_event(event)
+        if canvas is None:
+            return
+        steps = int(-event.delta / 120)
+        if steps == 0:
+            steps = -1 if event.delta > 0 else 1
+        self._scroll_canvas(canvas, steps, "units")
+
+    def _handle_shift_mousewheel(self, event):
+        """Allow faster page-style scrolling while holding Shift."""
+        if not event.delta:
+            return
+        canvas = self._resolve_scroll_canvas_from_event(event)
+        if canvas is None:
+            return
+        steps = -1 if event.delta > 0 else 1
+        self._scroll_canvas(canvas, steps, "pages")
+
+    def _build_quick_start_card(self, parent):
+        """Show the simplest next steps and current app state."""
+        card = self._make_card(parent, "🧭 QUICK START", "เริ่มใช้งานได้ใน 3 ขั้นตอน", collapsible=True, collapse_key="quick_start")
+
+        status_grid = tk.Frame(card, bg=COLORS["bg_card"])
+        status_grid.pack(fill=tk.X, padx=10, pady=(4, 6))
+
+        items = [
+            ("การเชื่อมต่อ", self.ui_connect_state, COLORS["yellow"]),
+            ("โหมด", self.ui_mode_state, COLORS["accent"]),
+            ("สิ่งที่ควรทำต่อ", self.ui_focus_state, COLORS["green"]),
+        ]
+        for row_index, (label_text, variable, color) in enumerate(items):
+            box = tk.Frame(status_grid, bg=COLORS["bg_input"], padx=10, pady=6)
+            box.grid(row=row_index, column=0, sticky="ew", pady=3)
+            status_grid.columnconfigure(0, weight=1)
+            tk.Label(
+                box, text=label_text, font=("Segoe UI", 8),
+                fg=COLORS["text_dim"], bg=COLORS["bg_input"], anchor="w"
+            ).pack(fill=tk.X)
+            tk.Label(
+                box, textvariable=variable, font=("Segoe UI", 9, "bold"),
+                fg=color, bg=COLORS["bg_input"], anchor="w", justify=tk.LEFT,
+                wraplength=320
+            ).pack(fill=tk.X)
+
+        steps = tk.Frame(card, bg=COLORS["bg_card"])
+        steps.pack(fill=tk.X, padx=10, pady=(0, 8))
+        for step in [
+            "1. Connect & Load Wallet",
+            "2. ตรวจ Auto Buy, SL, TP และเลือก Paper/Live",
+            "3. กด START BOT แล้วดู Decision / Risk Status",
+        ]:
+            tk.Label(
+                steps,
+                text=step,
+                font=("Segoe UI", 8),
+                fg=COLORS["text_dim"],
+                bg=COLORS["bg_card"],
+                anchor="w",
+            ).pack(fill=tk.X, pady=1)
+
+    def _refresh_quick_start_summary(self):
+        """Refresh the top-right quick start state summary."""
+        symbol = self.config.trading.symbol
+        mode_label = "PAPER" if self._is_paper_trade_mode() else "LIVE"
+        self.ui_mode_state.set(f"โหมด: {mode_label} | Symbol: {symbol}")
+
+        if self.is_connected:
+            self.ui_connect_state.set("เชื่อมต่อแล้ว พร้อมโหลดราคาและ wallet")
+        else:
+            self.ui_connect_state.set("ยังไม่ได้เชื่อมต่อ Exchange")
+
+        if not self.is_connected:
+            self.ui_focus_state.set("ขั้นตอนถัดไป: ใส่ API แล้วกด Connect & Load Wallet")
+        elif not self.bot_running:
+            self.ui_focus_state.set("ขั้นตอนถัดไป: ตรวจค่าความเสี่ยง แล้วกด START BOT")
+        elif self.boss_waiting_recovery or self.reentry_waiting:
+            self.ui_focus_state.set("บอทกำลังรอจังหวะซื้อคืน ดูรายละเอียดที่ Decision และ Risk Status")
+        else:
+            self.ui_focus_state.set("บอทกำลังทำงาน ดู Action ล่าสุด, Decision และ P/L ได้ทันที")
 
     def _build_top_bar(self, parent):
         """Build the top bar with title and status."""
@@ -253,7 +521,7 @@ class TradingBotGUI:
 
     def _build_bot_status_card(self, parent):
         """Build bot live status & performance summary card."""
-        card = self._make_card(parent, "🤖 BOT STATUS & PERFORMANCE")
+        card = self._make_card(parent, "🤖 สถานะและผลงานบอท")
 
         # ── Row 1: Status indicator + Uptime + Cycles ──
         row1 = tk.Frame(card, bg=COLORS["bg_card"])
@@ -261,7 +529,7 @@ class TradingBotGUI:
 
         # Live / Stopped indicator
         self.bot_alive_label = tk.Label(
-            row1, text="⏹ STOPPED", font=("Segoe UI", 11, "bold"),
+            row1, text="⏹ หยุดอยู่", font=("Segoe UI", 11, "bold"),
             fg=COLORS["red"], bg=COLORS["bg_card"]
         )
         self.bot_alive_label.pack(side=tk.LEFT)
@@ -269,7 +537,7 @@ class TradingBotGUI:
         # Uptime
         upt_f = tk.Frame(row1, bg=COLORS["bg_card"])
         upt_f.pack(side=tk.LEFT, padx=(20, 0))
-        tk.Label(upt_f, text="⏱ Uptime:", font=("Segoe UI", 8),
+        tk.Label(upt_f, text="⏱ เวลาทำงาน:", font=("Segoe UI", 8),
                  fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side=tk.LEFT)
         tk.Label(upt_f, textvariable=self.bot_uptime_str,
                  font=("Consolas", 10, "bold"),
@@ -278,7 +546,7 @@ class TradingBotGUI:
         # Cycles
         cyc_f = tk.Frame(row1, bg=COLORS["bg_card"])
         cyc_f.pack(side=tk.LEFT, padx=(20, 0))
-        tk.Label(cyc_f, text="🔄 Cycles:", font=("Segoe UI", 8),
+        tk.Label(cyc_f, text="🔄 รอบทำงาน:", font=("Segoe UI", 8),
                  fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side=tk.LEFT)
         tk.Label(cyc_f, textvariable=self.bot_cycles_str,
                  font=("Consolas", 10, "bold"),
@@ -287,7 +555,7 @@ class TradingBotGUI:
         # Last action
         act_f = tk.Frame(row1, bg=COLORS["bg_card"])
         act_f.pack(side=tk.RIGHT)
-        tk.Label(act_f, text="Last:", font=("Segoe UI", 8),
+        tk.Label(act_f, text="ล่าสุด:", font=("Segoe UI", 8),
                  fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side=tk.LEFT)
         self.bot_last_action_label = tk.Label(
             act_f, textvariable=self.bot_last_action,
@@ -301,9 +569,9 @@ class TradingBotGUI:
         row2.pack(fill=tk.X, padx=10, pady=(2, 5))
 
         perf_items = [
-            ("💰 Realized P/L", self.bot_realized_pnl_str, "realized_pnl"),
-            ("📊 Total P/L", self.bot_total_pnl_str, "total_pnl"),
-            ("🏆 Win Rate", self.bot_winrate_str, "winrate"),
+            ("💰 กำไร/ขาดทุนที่ปิดแล้ว", self.bot_realized_pnl_str, "realized_pnl"),
+            ("📊 กำไร/ขาดทุนรวม", self.bot_total_pnl_str, "total_pnl"),
+            ("🏆 อัตราชนะ", self.bot_winrate_str, "winrate"),
         ]
 
         self._perf_labels = {}
@@ -325,18 +593,32 @@ class TradingBotGUI:
 
         self.bot_trade_stats_label = tk.Label(
             row3,
-            text="Trades: 0  |  ✅ Win: 0  |  ❌ Lose: 0",
+            text="เทรด: 0  |  ✅ ชนะ: 0  |  ❌ แพ้: 0",
             font=("Segoe UI", 9),
             fg=COLORS["text_dim"], bg=COLORS["bg_card"]
         )
         self.bot_trade_stats_label.pack(side=tk.LEFT)
 
-        # Boss Mode status
-        self.bot_boss_status_label = tk.Label(
-            row3, text="", font=("Segoe UI", 9, "bold"),
-            fg=COLORS["yellow"], bg=COLORS["bg_card"]
+        row4 = tk.Frame(card, bg=COLORS["bg_input"])
+        row4.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        tk.Label(
+            row4, text="เหตุผลการตัดสินใจ", font=("Segoe UI", 8),
+            fg=COLORS["text_dim"], bg=COLORS["bg_input"], anchor="w"
+        ).pack(fill=tk.X, padx=10, pady=(6, 0))
+
+        self.bot_decision_status_label = tk.Label(
+            row4, textvariable=self.bot_decision_status, font=("Segoe UI", 9, "bold"),
+            fg=COLORS["text_bright"], bg=COLORS["bg_input"], anchor="w", justify=tk.LEFT
         )
-        self.bot_boss_status_label.pack(side=tk.RIGHT)
+        self.bot_decision_status_label.pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        self.bot_decision_detail_label = tk.Label(
+            row4, textvariable=self.bot_decision_detail, font=("Segoe UI", 8),
+            fg=COLORS["text_dim"], bg=COLORS["bg_input"], anchor="w", justify=tk.LEFT,
+            wraplength=380
+        )
+        self.bot_decision_detail_label.pack(fill=tk.X, padx=10, pady=(0, 6))
 
     def _build_wallet_card(self, parent):
         """Build wallet / balance display card."""
@@ -406,18 +688,19 @@ class TradingBotGUI:
         """Build open positions table."""
         card = self._make_card(parent, "💼 OPEN POSITIONS")
 
-        columns = ("symbol", "entry", "current", "pnl", "amount", "sl", "tp")
+        columns = ("symbol", "entry", "current", "pnl", "pnl_thb", "amount", "sl", "tp")
         self.positions_tree = ttk.Treeview(card, columns=columns, show="headings",
                                            height=4)
 
         headers = {
-            "symbol": ("Symbol", 80),
-            "entry": ("Entry Price", 100),
-            "current": ("Current", 100),
-            "pnl": ("P/L %", 70),
-            "amount": ("Amount", 100),
-            "sl": ("Stop Loss", 90),
-            "tp": ("Take Profit", 90),
+            "symbol": ("Symbol", 74),
+            "entry": ("Entry Price", 92),
+            "current": ("Current", 92),
+            "pnl": ("P/L %", 64),
+            "pnl_thb": ("P/L THB", 88),
+            "amount": ("Amount", 94),
+            "sl": ("Stop Loss", 82),
+            "tp": ("Take Profit", 82),
         }
         for col, (text, width) in headers.items():
             self.positions_tree.heading(col, text=text)
@@ -438,7 +721,7 @@ class TradingBotGUI:
 
     def _build_api_settings(self, parent):
         """Build API settings panel."""
-        card = self._make_card(parent, "🔑 API SETTINGS")
+        card = self._make_card(parent, "🔑 API SETTINGS", collapsible=True, collapse_key="api_settings")
 
         # API Key
         tk.Label(card, text="API Key:", font=("Segoe UI", 9),
@@ -501,7 +784,7 @@ class TradingBotGUI:
         tk.Label(sym_frame, text="เหรียญที่จะเทรด:", font=("Segoe UI", 9),
                  fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side=tk.LEFT)
 
-        self.symbol_var = tk.StringVar(value="BTC_THB")
+        self.symbol_var = tk.StringVar(value=self.config.trading.symbol)
         symbols = ["BTC_THB", "ETH_THB", "ADA_THB", "DOT_THB", "DOGE_THB",
                     "XRP_THB", "SOL_THB", "LINK_THB", "MATIC_THB"]
         self.symbol_combo = ttk.Combobox(sym_frame, textvariable=self.symbol_var,
@@ -527,15 +810,16 @@ class TradingBotGUI:
 
     def _build_ai_card(self, parent):
         """Build AI prediction display."""
-        card = self._make_card(parent, "🧠 AI PREDICTION")
+        card = self._make_card(parent, "🧠 AI PREDICTION", "สรุปมุมมอง AI ที่มีผลต่อการเข้าออก", collapsible=True, collapse_key="ai_prediction")
 
         grid = tk.Frame(card, bg=COLORS["bg_card"])
         grid.pack(fill=tk.X, padx=10, pady=5)
 
-        for i, (label, var) in enumerate([
-            ("Direction", self.ai_direction),
-            ("Confidence", self.ai_confidence),
-            ("Predicted", self.ai_predicted),
+        for i, (key, label, var) in enumerate([
+            ("direction", "Direction", self.ai_direction),
+            ("confidence", "Confidence", self.ai_confidence),
+            ("predicted", "Predicted", self.ai_predicted),
+            ("llm_trade", "LLM Trade", self.trade_llm_status),
         ]):
             f = tk.Frame(grid, bg=COLORS["bg_input"], padx=8, pady=4)
             f.grid(row=0, column=i, padx=3, sticky="ew")
@@ -543,12 +827,28 @@ class TradingBotGUI:
 
             tk.Label(f, text=label, font=("Segoe UI", 8),
                      fg=COLORS["text_dim"], bg=COLORS["bg_input"]).pack()
-            tk.Label(f, textvariable=var, font=("Segoe UI", 10, "bold"),
-                     fg=COLORS["text_bright"], bg=COLORS["bg_input"]).pack()
+            value_label = tk.Label(
+                f,
+                textvariable=var,
+                font=("Segoe UI", 10, "bold"),
+                fg=COLORS["text_bright"],
+                bg=COLORS["bg_input"],
+            )
+            value_label.pack()
+            self._ai_metric_labels[key] = value_label
 
     def _build_controls_card(self, parent):
         """Build control buttons."""
-        card = self._make_card(parent, "⚙️ CONTROLS")
+        card = self._make_card(parent, "⚙️ CONTROLS", "ค่าใช้งานจริงของบอทและระบบอัตโนมัติ", collapsible=True, collapse_key="controls")
+
+        tk.Label(
+            card,
+            text="Core Settings",
+            font=("Segoe UI", 8, "bold"),
+            fg=COLORS["accent"],
+            bg=COLORS["bg_card"],
+            anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(4, 0))
 
         # Trading settings row
         settings = tk.Frame(card, bg=COLORS["bg_card"])
@@ -562,7 +862,7 @@ class TradingBotGUI:
         tk.Label(interval_header, text="Interval (s):", font=("Segoe UI", 8),
              fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side=tk.LEFT)
         self._create_runtime_badge(interval_header, "interval")
-        self.interval_var = tk.StringVar(value="30")
+        self.interval_var = tk.StringVar(value=str(self.config.trading.trading_interval_seconds))
         tk.Entry(f1, textvariable=self.interval_var, font=("Segoe UI", 9),
                  bg=COLORS["bg_input"], fg=COLORS["text"], width=6,
                  relief=tk.FLAT, insertbackground=COLORS["text"]).pack(
@@ -576,7 +876,7 @@ class TradingBotGUI:
         tk.Label(sl_header, text="SL %:", font=("Segoe UI", 8),
              fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side=tk.LEFT)
         self._create_runtime_badge(sl_header, "sl")
-        self.sl_var = tk.StringVar(value="1.8")
+        self.sl_var = tk.StringVar(value=f"{self.config.trading.stop_loss_pct:.2f}")
         tk.Entry(f2, textvariable=self.sl_var, font=("Segoe UI", 9),
                  bg=COLORS["bg_input"], fg=COLORS["text"], width=6,
                  relief=tk.FLAT, insertbackground=COLORS["text"]).pack(
@@ -590,7 +890,7 @@ class TradingBotGUI:
         tk.Label(tp_header, text="TP %:", font=("Segoe UI", 8),
              fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side=tk.LEFT)
         self._create_runtime_badge(tp_header, "tp")
-        self.tp_var = tk.StringVar(value="5.0")
+        self.tp_var = tk.StringVar(value=f"{self.config.trading.take_profit_pct:.2f}")
         tk.Entry(f3, textvariable=self.tp_var, font=("Segoe UI", 9),
                  bg=COLORS["bg_input"], fg=COLORS["text"], width=6,
                  relief=tk.FLAT, insertbackground=COLORS["text"]).pack(
@@ -613,6 +913,25 @@ class TradingBotGUI:
         )
         auto_buy_entry.pack(fill=tk.X, ipady=2)
         self._enable_paste(auto_buy_entry)
+
+        tk.Label(
+            card,
+            text="ระบบจะ cap ขนาดไม้ซื้ออัตโนมัติตาม downtrend, ATR, และ loss streak อัตโนมัติ",
+            font=("Segoe UI", 8),
+            fg=COLORS["text_dim"],
+            bg=COLORS["bg_card"],
+            anchor="w",
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        tk.Label(
+            card,
+            text="Automation",
+            font=("Segoe UI", 8, "bold"),
+            fg=COLORS["accent"],
+            bg=COLORS["bg_card"],
+            anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(2, 0))
 
         ai_manage_frame = tk.Frame(card, bg=COLORS["bg_card"])
         ai_manage_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
@@ -653,7 +972,40 @@ class TradingBotGUI:
                  bg=COLORS["bg_input"], fg=COLORS["text"], width=6,
                  relief=tk.FLAT, insertbackground=COLORS["text"]).pack(side=tk.LEFT, ipady=2)
 
+        ai_row3 = tk.Frame(ai_manage_frame, bg=COLORS["bg_card"])
+        ai_row3.pack(fill=tk.X, pady=(2, 0))
+        self.llm_trade_check = tk.Checkbutton(
+            ai_row3, text="🧠 LLM Trade Advisor", font=("Segoe UI", 9, "bold"),
+            variable=self.llm_trade_enabled, fg=COLORS["yellow"],
+            bg=COLORS["bg_card"], selectcolor=COLORS["bg_input"],
+            activebackground=COLORS["bg_card"], activeforeground=COLORS["yellow"],
+            cursor="hand2"
+        )
+        self.llm_trade_check.pack(side=tk.LEFT)
+        self._create_runtime_badge(ai_row3, "llm_trade_enabled")
+
+        ai_row4 = tk.Frame(ai_manage_frame, bg=COLORS["bg_card"])
+        ai_row4.pack(fill=tk.X, pady=(2, 0))
+        self.paper_trade_check = tk.Checkbutton(
+            ai_row4, text="🧪 Paper Trading", font=("Segoe UI", 9, "bold"),
+            variable=self.paper_trade_enabled, fg=COLORS["accent"],
+            bg=COLORS["bg_card"], selectcolor=COLORS["bg_input"],
+            activebackground=COLORS["bg_card"], activeforeground=COLORS["accent"],
+            cursor="hand2"
+        )
+        self.paper_trade_check.pack(side=tk.LEFT)
+        self._create_runtime_badge(ai_row4, "paper_trade_enabled")
+
         # Boss Mode section
+        tk.Label(
+            card,
+            text="Recovery",
+            font=("Segoe UI", 8, "bold"),
+            fg=COLORS["accent"],
+            bg=COLORS["bg_card"],
+            anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(4, 0))
+
         boss_frame = tk.Frame(card, bg=COLORS["bg_card"])
         boss_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
 
@@ -783,18 +1135,32 @@ class TradingBotGUI:
 
     def _build_risk_card(self, parent):
         """Build risk status display."""
-        card = self._make_card(parent, "⚠️ RISK STATUS")
+        card = self._make_card(parent, "⚠️ RISK STATUS", "ดูว่าระบบกำลังลดไม้หรือพักซื้อเพราะอะไร", collapsible=True, collapse_key="risk_status")
 
         self.risk_text = tk.Label(
-            card, text="Daily Loss: 0 / 5,000 THB  |  Positions: 0 / 3",
+            card, text="Daily Loss: 0 / 3,000 THB  |  Positions: 0 / 2",
             font=("Segoe UI", 9), fg=COLORS["text"],
             bg=COLORS["bg_card"], anchor="w"
         )
         self.risk_text.pack(fill=tk.X, padx=10, pady=5)
 
+        self.risk_regime_label = tk.Label(
+            card, textvariable=self.risk_regime_text,
+            font=("Segoe UI", 8, "bold"), fg=COLORS["yellow"],
+            bg=COLORS["bg_card"], anchor="w", justify=tk.LEFT
+        )
+        self.risk_regime_label.pack(fill=tk.X, padx=10, pady=(0, 3))
+
+        self.risk_guard_label = tk.Label(
+            card, textvariable=self.risk_guard_text,
+            font=("Segoe UI", 8), fg=COLORS["text_dim"],
+            bg=COLORS["bg_card"], anchor="w", justify=tk.LEFT, wraplength=340
+        )
+        self.risk_guard_label.pack(fill=tk.X, padx=10, pady=(0, 6))
+
     def _build_quick_trade_card(self, parent):
         """Build manual quick trade card with Buy/Sell buttons."""
-        card = self._make_card(parent, "💸 QUICK TRADE")
+        card = self._make_card(parent, "💸 QUICK TRADE", "เลือกได้ว่าจะซื้อทันทีหรือให้บอทตัดสินใจซื้อหนึ่งรอบ", collapsible=True, collapse_key="quick_trade")
 
         # Amount input
         amt_frame = tk.Frame(card, bg=COLORS["bg_card"])
@@ -810,6 +1176,53 @@ class TradingBotGUI:
         )
         trade_amt_entry.pack(side=tk.RIGHT, ipady=2)
         self._enable_paste(trade_amt_entry)
+
+        mode_frame = tk.Frame(card, bg=COLORS["bg_card"])
+        mode_frame.pack(fill=tk.X, padx=10, pady=(2, 6))
+
+        tk.Label(mode_frame, text="Quick Buy Mode:", font=("Segoe UI", 8),
+                 fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(anchor="w")
+
+        mode_options = tk.Frame(mode_frame, bg=COLORS["bg_card"])
+        mode_options.pack(fill=tk.X, pady=(3, 0))
+
+        tk.Radiobutton(
+            mode_options,
+            text="Manual Buy + Auto Trade",
+            value="manual_auto",
+            variable=self.quick_buy_mode_var,
+            font=("Segoe UI", 9),
+            fg=COLORS["text"],
+            bg=COLORS["bg_card"],
+            selectcolor=COLORS["bg_input"],
+            activebackground=COLORS["bg_card"],
+            activeforeground=COLORS["text_bright"],
+            cursor="hand2",
+        ).pack(anchor="w")
+
+        tk.Radiobutton(
+            mode_options,
+            text="Auto Trade Only",
+            value="auto_only",
+            variable=self.quick_buy_mode_var,
+            font=("Segoe UI", 9),
+            fg=COLORS["text"],
+            bg=COLORS["bg_card"],
+            selectcolor=COLORS["bg_input"],
+            activebackground=COLORS["bg_card"],
+            activeforeground=COLORS["text_bright"],
+            cursor="hand2",
+        ).pack(anchor="w")
+
+        tk.Label(
+            card,
+            textvariable=self.quick_buy_mode_hint,
+            font=("Segoe UI", 8),
+            fg=COLORS["text_dim"],
+            bg=COLORS["bg_card"],
+            anchor="w",
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=10, pady=(0, 6))
 
         # Buy / Sell buttons
         btn_frame = tk.Frame(card, bg=COLORS["bg_card"])
@@ -830,6 +1243,27 @@ class TradingBotGUI:
             cursor="hand2", command=self._quick_sell, state=tk.DISABLED
         )
         self.quick_sell_btn.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(3, 0), ipady=4)
+
+    def _on_quick_buy_mode_change(self, *args):
+        """Refresh the quick-buy UI when the behavior mode changes."""
+        self._refresh_quick_buy_mode_ui()
+
+    def _refresh_quick_buy_mode_ui(self):
+        """Apply the selected quick-buy mode to button text and helper copy."""
+        mode = self.quick_buy_mode_var.get()
+        if mode == "auto_only":
+            self.quick_buy_mode_hint.set(
+                "Auto Trade Only: ให้บอทประเมิน BUY หนึ่งรอบทันทีโดยใช้กฎ AI, risk sizing และ Auto Buy cap ของบอท"
+            )
+            if hasattr(self, "quick_buy_btn"):
+                self.quick_buy_btn.config(text="🤖 AUTO BUY 1X")
+            return
+
+        self.quick_buy_mode_hint.set(
+            "Manual Buy + Auto Trade: ซื้อทันทีด้วยจำนวนที่กรอก แล้วเริ่มบอทให้ดูแล position ต่อ"
+        )
+        if hasattr(self, "quick_buy_btn"):
+            self.quick_buy_btn.config(text="📈 BUY NOW")
 
     def _build_pnl_card(self, parent):
         """Build real-time Profit/Loss monitoring card."""
@@ -868,7 +1302,7 @@ class TradingBotGUI:
 
     def _build_history_card(self, parent):
         """Build trade history."""
-        card = self._make_card(parent, "📜 TRADE HISTORY")
+        card = self._make_card(parent, "📜 TRADE HISTORY", "รายการคำสั่งล่าสุดของ session นี้", collapsible=True, collapse_key="trade_history", start_collapsed=True)
 
         columns = ("time", "type", "price", "pnl")
         self.history_tree = ttk.Treeview(card, columns=columns, show="headings",
@@ -887,7 +1321,8 @@ class TradingBotGUI:
 
     # ─── Helpers ──────────────────────────────────────────────
 
-    def _make_card(self, parent, title: str) -> tk.Frame:
+    def _make_card(self, parent, title: str, subtitle: str = "", collapsible: bool = False,
+                   collapse_key: str = "", start_collapsed: bool = False) -> tk.Frame:
         """Create a styled card frame."""
         wrapper = tk.Frame(parent, bg=COLORS["bg"])
         wrapper.pack(fill=tk.X, pady=(0, 5))
@@ -896,12 +1331,78 @@ class TradingBotGUI:
                         highlightthickness=1)
         card.pack(fill=tk.X)
 
-        # Title bar
-        tk.Label(card, text=title, font=("Segoe UI", 10, "bold"),
-                 fg=COLORS["accent"], bg=COLORS["bg_card"],
-                 anchor="w").pack(fill=tk.X, padx=10, pady=(8, 2))
+        header = tk.Frame(card, bg=COLORS["bg_card"])
+        header.pack(fill=tk.X, padx=10, pady=(8, 2))
 
-        return card
+        tk.Label(header, text=title, font=("Segoe UI", 10, "bold"),
+                 fg=COLORS["accent"], bg=COLORS["bg_card"],
+                 anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        body_wrap = tk.Frame(card, bg=COLORS["bg_card"])
+        body_wrap.pack(fill=tk.X)
+
+        if collapsible and collapse_key:
+            toggle_button = tk.Button(
+                header,
+                text="−",
+                font=("Segoe UI", 9, "bold"),
+                bg=COLORS["bg_input"],
+                fg=COLORS["text_bright"],
+                activebackground=COLORS["accent2"],
+                relief=tk.FLAT,
+                cursor="hand2",
+                width=2,
+                command=lambda key=collapse_key: self._toggle_card_section(key),
+            )
+            toggle_button.pack(side=tk.RIGHT)
+            self._collapsible_cards[collapse_key] = {
+                "body_wrap": body_wrap,
+                "button": toggle_button,
+                "collapsed": False,
+            }
+
+        if subtitle:
+            tk.Label(
+                body_wrap,
+                text=subtitle,
+                font=("Segoe UI", 8),
+                fg=COLORS["text_dim"],
+                bg=COLORS["bg_card"],
+                anchor="w",
+                justify=tk.LEFT,
+            ).pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        body = tk.Frame(body_wrap, bg=COLORS["bg_card"])
+        body.pack(fill=tk.X)
+
+        if collapsible and collapse_key and start_collapsed:
+            self._set_card_collapsed(collapse_key, True)
+
+        return body
+
+    def _toggle_card_section(self, collapse_key: str):
+        """Toggle a collapsible card body."""
+        state = self._collapsible_cards.get(collapse_key)
+        if not state:
+            return
+        self._set_card_collapsed(collapse_key, not bool(state.get("collapsed")))
+
+    def _set_card_collapsed(self, collapse_key: str, collapsed: bool):
+        """Apply collapsed or expanded state to a card section."""
+        state = self._collapsible_cards.get(collapse_key)
+        if not state:
+            return
+        body_wrap = state.get("body_wrap")
+        button = state.get("button")
+        if body_wrap is None or button is None:
+            return
+        if collapsed:
+            body_wrap.pack_forget()
+            button.config(text="+")
+        else:
+            body_wrap.pack(fill=tk.X)
+            button.config(text="−")
+        state["collapsed"] = collapsed
 
     def _create_runtime_badge(self, parent, field_key: str, padx=(6, 0)) -> tk.Label:
         """Create a compact badge that shows whether a parameter is pending or already live."""
@@ -929,6 +1430,8 @@ class TradingBotGUI:
             "ai_scale_in_loss_pct": lambda: float(self.ai_scale_in_loss_pct_var.get()),
             "ai_take_profit_enabled": lambda: bool(self.ai_take_profit_enabled.get()),
             "ai_take_profit_pct": lambda: float(self.ai_take_profit_pct_var.get()),
+            "llm_trade_enabled": lambda: bool(self.llm_trade_enabled.get()),
+            "paper_trade_enabled": lambda: bool(self.paper_trade_enabled.get()),
             "boss_mode": lambda: bool(self.boss_mode.get()),
             "boss_cutloss": lambda: float(self.boss_cutloss_pct_var.get()),
             "boss_recovery": lambda: float(self.boss_recovery_pct_var.get()),
@@ -945,6 +1448,8 @@ class TradingBotGUI:
             self.ai_scale_in_loss_pct_var,
             self.ai_take_profit_enabled,
             self.ai_take_profit_pct_var,
+            self.llm_trade_enabled,
+            self.paper_trade_enabled,
             self.boss_mode,
             self.boss_cutloss_pct_var,
             self.boss_recovery_pct_var,
@@ -955,10 +1460,31 @@ class TradingBotGUI:
         for variable in tracked_vars:
             variable.trace_add("write", self._on_runtime_field_change)
         self._refresh_runtime_badges()
+        self._refresh_quick_start_summary()
 
     def _on_runtime_field_change(self, *args):
         """Refresh parameter badges when the user edits a runtime field."""
         self._refresh_runtime_badges()
+        self._refresh_quick_start_summary()
+        if self.bot_running:
+            self._schedule_runtime_settings_apply()
+
+    def _schedule_runtime_settings_apply(self):
+        """Debounce live runtime config updates while the bot is running."""
+        if self._runtime_apply_after_id is not None:
+            try:
+                self.root.after_cancel(self._runtime_apply_after_id)
+            except tk.TclError:
+                pass
+        self._runtime_apply_after_id = self.root.after(350, self._apply_runtime_settings_live)
+
+    def _apply_runtime_settings_live(self):
+        """Apply edited runtime parameters immediately without stopping auto trade."""
+        self._runtime_apply_after_id = None
+        if not self.bot_running:
+            return
+        self._sync_runtime_settings(show_popup=False)
+        self._refresh_quick_start_summary()
 
     def _set_runtime_badge_state(self, badge: tk.Label, state: str):
         """Apply badge style for the current parameter state."""
@@ -1143,6 +1669,415 @@ class TradingBotGUI:
                         background=COLORS["bg_card"],
                         foreground=COLORS["text"])
 
+    def _sync_llm_trade_status_visual(self):
+        """Refresh the LLM Trade label text and color based on runtime state."""
+        label = self._ai_metric_labels.get("llm_trade")
+        if not label:
+            return
+
+        advice = self.last_trade_llm_advice or {}
+        if not self.llm_trade_enabled.get():
+            label.config(fg=COLORS["text_dim"])
+            self.trade_llm_status.set("DISABLED")
+            return
+
+        if advice.get("used"):
+            confidence = float(advice.get("confidence", 0.0) or 0.0)
+            if confidence >= 0.8:
+                color = COLORS["green"]
+            elif confidence >= 0.68:
+                color = COLORS["yellow"]
+            else:
+                color = COLORS["red"]
+            label.config(fg=color)
+            self.trade_llm_status.set(f"{advice.get('action', 'HOLD')} {confidence:.0%}")
+            return
+
+        if self.llm_boss_advisor.is_enabled():
+            label.config(fg=COLORS["yellow"])
+            self.trade_llm_status.set("STANDBY")
+        else:
+            has_key = bool(getattr(self.config.ai, "openai_api_key", ""))
+            label.config(fg=COLORS["red"] if not has_key else COLORS["text_dim"])
+            self.trade_llm_status.set("NO KEY" if not has_key else "IDLE")
+
+    def _rebuild_llm_advisor(self):
+        """Recreate the LLM advisor after runtime enable/disable changes."""
+        self.llm_boss_advisor = LLMBossAdvisor(self.config.ai, self.config.trading, self.logger)
+
+    @staticmethod
+    def _truncate_ui_text(text: str, max_length: int = 72) -> str:
+        """Keep runtime status text compact enough for the dashboard."""
+        clean = " ".join(str(text or "").split())
+        if len(clean) <= max_length:
+            return clean
+        return clean[: max_length - 3].rstrip() + "..."
+
+    def _format_reason_list(self, reasons, max_items: int = 3, max_length: int = 156) -> str:
+        """Flatten multiple strategy reasons into a short readable summary."""
+        normalized = [
+            self._translate_decision_reason(" ".join(str(reason or "").split()))
+            for reason in (reasons or [])
+            if str(reason or "").strip()
+        ]
+        if not normalized:
+            return ""
+
+        text = " | ".join(normalized[:max_items])
+        if len(normalized) > max_items:
+            text = f"{text} | ..."
+        return self._truncate_ui_text(text, max_length)
+
+    def _translate_decision_reason(self, reason: str) -> str:
+        """Translate strategy and risk reasons into Thai for the Decision Insight panel."""
+        text = " ".join(str(reason or "").split())
+        if not text:
+            return ""
+
+        if text.startswith("LLM:"):
+            llm_reason = text.split(":", 1)[1].strip()
+            return f"LLM แนะนำ: {llm_reason}" if llm_reason else "LLM แนะนำ"
+
+        patterns = [
+            (r"^RSI oversold \((.+) < (.+)\)$", lambda m: f"RSI อยู่ในเขตขายมากเกินไป ({m.group(1)} < {m.group(2)})"),
+            (r"^Price \((.+)\) below EMA21 \((.+)\)$", lambda m: f"ราคาปัจจุบัน ({m.group(1)}) ต่ำกว่า EMA21 ({m.group(2)})"),
+            (r"^Price is holding near support (.+) \((.+)% above support\)$", lambda m: f"ราคายืนใกล้แนวรับ {m.group(1)} ({m.group(2).replace('above support', 'เหนือแนวรับ')})"),
+            (r"^Price broke resistance (.+) and is entering momentum continuation$", lambda m: f"ราคาทะลุแนวต้าน {m.group(1)} และเริ่มต่อโมเมนตัมขาขึ้น"),
+            (r"^AI predicts UP \(confidence: (.+)\)$", lambda m: f"AI มองว่าราคาจะขึ้น (ความมั่นใจ: {m.group(1)})"),
+            (r"^AI expects upside (.+)%$", lambda m: f"AI คาดว่าราคามี upside {m.group(1)}%"),
+            (r"^Price entered buy zone (.+)-(.+)$", lambda m: f"ราคาเข้าโซนซื้อ {m.group(1)}-{m.group(2)}"),
+            (r"^RSI is within buy-zone limit \((.+) <= (.+)\)$", lambda m: f"RSI อยู่ในเกณฑ์โซนซื้อ ({m.group(1)} <= {m.group(2)})"),
+            (r"^Volume support confirmed \((.+)\)$", lambda m: f"ปริมาณซื้อขายสนับสนุน ({m.group(1)})"),
+            (r"^Volume too light \((.+)\), skipping weak setup$", lambda m: f"ปริมาณซื้อขายเบาเกินไป ({m.group(1)}) จึงยังข้ามจังหวะอ่อนนี้"),
+            (r"^Daily loss limit reached: (.+) >= (.+) THB$", lambda m: f"ขาดทุนสะสมวันนี้ถึงลิมิตแล้ว: {m.group(1)} >= {m.group(2)} THB"),
+            (r"^Daily trade limit reached: (.+) >= (.+)$", lambda m: f"จำนวนเทรดวันนี้ถึงลิมิตแล้ว: {m.group(1)} >= {m.group(2)}"),
+            (r"^Consecutive loss limit reached: (.+) >= (.+)$", lambda m: f"แพ้ติดต่อกันถึงลิมิตแล้ว: {m.group(1)} >= {m.group(2)}"),
+            (r"^Max open positions reached: (.+) >= (.+)$", lambda m: f"จำนวน position เปิดพร้อมกันถึงลิมิตแล้ว: {m.group(1)} >= {m.group(2)}"),
+            (r"^Insufficient balance: (.+) THB$", lambda m: f"ยอดเงินไม่พอ: {m.group(1)} THB"),
+        ]
+
+        for pattern, formatter in patterns:
+            match = re.match(pattern, text)
+            if match:
+                return formatter(match)
+
+        literal_map = {
+            "Trend filter passed: EMA9 > EMA21 > EMA50": "เทรนด์ผ่านเงื่อนไข: EMA9 > EMA21 > EMA50",
+            "Short-term trend still positive": "เทรนด์ระยะสั้นยังเป็นบวก",
+            "MACD bullish crossover": "MACD ตัดขึ้น",
+            "Price below Bollinger lower band": "ราคาต่ำกว่าเส้นล่าง Bollinger Band",
+            "Auto-buy triggered because price is inside the configured buy zone": "เข้าเงื่อนไขซื้ออัตโนมัติ เพราะราคาอยู่ในโซนซื้อที่ตั้งไว้",
+            "Dip-buy setup detected: price weakened and AI allows accumulation": "เข้าเงื่อนไขซื้อย่อ: ราคาอ่อนตัวและ AI อนุญาตให้สะสม",
+            "Trend-buy setup detected: price is climbing and AI allows momentum entry": "เข้าเงื่อนไขซื้อตามเทรนด์: ราคากำลังขึ้นและ AI อนุญาตให้เข้าตามโมเมนตัม",
+            "Uptrend pullback entry: AI waits for support, then buys on strength": "เข้าเงื่อนไขย่อในขาขึ้น: AI รอรับแถวแนวรับแล้วค่อยซื้อเมื่อแรงกลับมา",
+            "Uptrend breakout entry confirmed above resistance": "เข้าเงื่อนไขทะลุแนวต้านขาขึ้นหลังผ่านแนวต้านแล้ว",
+            "Counter-trend reversal allowed: strong AI rebound from support": "เข้าเงื่อนไขกลับตัวสวนเทรนด์: AI เห็นแรงเด้งจากแนวรับชัดเจน",
+            "Downtrend protection active: waiting for EMA9 reclaim, bullish MACD, and strong AI volume confirmation": "ระบบกันตลาดขาลงกำลังทำงาน: รอราคา reclaim EMA9, MACD กลับตัว และปริมาณ/AI แข็งแรงก่อน",
+            "Downtrend recovery confirmation passed: price reclaimed EMA9 with strong volume": "ยืนยันการฟื้นตัวในตลาดลงแล้ว: ราคา reclaim EMA9 พร้อมปริมาณซื้อขายหนุน",
+            "Downtrend protection active after recent losses": "ระบบกันขาดทุนหยุดซื้อชั่วคราว เพราะยังอยู่ใน downtrend หลังแพ้ติดกัน",
+            "AI is waiting for either a dip-buy near support or a trend-buy on strength": "AI ยังรอให้เกิดจังหวะซื้อย่อใกล้แนวรับ หรือซื้อเมื่อราคาแข็งแรงตามเทรนด์",
+        }
+        return literal_map.get(text, text)
+
+    def _build_buy_wait_hint(self, price: float, signals: Dict, buy_signal: Dict) -> str:
+        """Explain the next price area the bot is waiting for before buying."""
+        buy_zone = buy_signal.get("buy_zone", {}) or {}
+        zone_low = float(buy_zone.get("zone_low", 0.0) or 0.0)
+        zone_high = float(buy_zone.get("zone_high", 0.0) or 0.0)
+        support_level = float(signals.get("support_level", 0.0) or 0.0)
+        resistance_level = float(signals.get("resistance_level", 0.0) or 0.0)
+
+        hints = []
+        if zone_low > 0 and zone_high > 0:
+            if price > zone_high:
+                hints.append(f"รอราคาเข้าโซนซื้อ {zone_low:,.2f}-{zone_high:,.2f}")
+            elif price < zone_low:
+                hints.append(f"รอราคายืนกลับเหนือ {zone_low:,.2f}")
+
+        if support_level > 0 and price > support_level:
+            hints.append(f"รอรับใกล้แนวรับ {support_level:,.2f}")
+
+        if resistance_level > 0:
+            breakout_price = resistance_level * (1 + self.config.trading.resistance_breakout_pct / 100)
+            if price < breakout_price:
+                hints.append(f"หรือรอทะลุแนวต้านเหนือ {breakout_price:,.2f}")
+
+        return self._truncate_ui_text(" | ".join(hints[:2]), 120)
+
+    def _build_decision_snapshot(self, symbol: str, current_price: float, balance: float,
+                                 positions, signals: Dict, ai_prediction: Dict,
+                                 action_name: str, risk_check: Optional[Dict] = None) -> Dict:
+        """Build a compact user-facing summary of why the bot buys, waits, or holds."""
+        if self.boss_waiting_recovery or (self.reentry_waiting and self.reentry_symbol == symbol):
+            snapshot = self._get_boss_runtime_snapshot(current_price)
+            return {
+                "status": snapshot["title"],
+                "detail": snapshot["detail"],
+                "color": snapshot["color"],
+            }
+
+        buy_signal = self.strategy.should_buy(signals, ai_prediction)
+        reason_text = self._format_reason_list(buy_signal.get("reasons", []))
+        wait_hint = self._build_buy_wait_hint(current_price, signals, buy_signal)
+        score_text = f"คะแนน {float(buy_signal.get('score', 0.0) or 0.0):.2f}/{self.config.trading.min_buy_signal_score:.2f}"
+
+        if action_name == "BUY":
+            detail = f"ซื้อที่ {current_price:,.2f} | {reason_text or score_text}"
+            return {"status": "📈 ซื้อ", "detail": self._truncate_ui_text(detail, 180), "color": COLORS["green"]}
+
+        if action_name in {"AUTO_REBUY", "BOSS_BUYBACK"}:
+            return {
+                "status": "🔁 ซื้อคืน",
+                "detail": f"ซื้อคืนแล้วที่ {current_price:,.2f} หลังราคาฟื้นตามเงื่อนไข",
+                "color": COLORS["green"],
+            }
+
+        if action_name in {"SELL", "STOP_LOSS", "TAKE_PROFIT", "AI_CUTLOSS", "AI_TAKE_PROFIT", "AI_BOSS_CUTLOSS"}:
+            action_label_map = {
+                "SELL": "ขาย",
+                "STOP_LOSS": "ตัดขาดทุน",
+                "TAKE_PROFIT": "ทำกำไร",
+                "AI_CUTLOSS": "AI ตัดขาดทุน",
+                "AI_TAKE_PROFIT": "AI ทำกำไร",
+                "AI_BOSS_CUTLOSS": "Boss AI ตัดขาดทุน",
+            }
+            return {
+                "status": f"📉 {action_label_map.get(action_name, action_name)}",
+                "detail": f"ปิดสถานะที่ {current_price:,.2f} แล้ว รอระบบประเมินจังหวะรอบถัดไป",
+                "color": COLORS["red"] if "LOSS" in action_name or "SELL" in action_name else COLORS["yellow"],
+            }
+
+        if action_name in {"INVALID_AUTO_BUY", "INSUFFICIENT_AUTO_BUY"}:
+            detail = f"ยังไม่ซื้อ | {reason_text or score_text}"
+            if wait_hint:
+                detail = f"{detail} | {wait_hint}"
+            return {"status": "⚠️ ซื้อไม่ได้", "detail": self._truncate_ui_text(detail, 180), "color": COLORS["yellow"]}
+
+        if positions:
+            position_summary = self._get_runtime_position_summary(current_price)
+            detail = position_summary["label"]
+            if buy_signal.get("should_buy"):
+                detail = f"มีสถานะค้างอยู่แล้ว | ซื้อเพิ่มเมื่อกำไรเฉลี่ยเกิน +1.00% | {detail}"
+            elif reason_text:
+                detail = f"ถืออยู่ | {detail} | {reason_text}"
+            return {"status": "🟡 ถือต่อ", "detail": self._truncate_ui_text(detail, 180), "color": COLORS["yellow"]}
+
+        if risk_check and not risk_check.get("allowed", True):
+            risk_text = self._format_reason_list(risk_check.get("reasons", []), max_items=2, max_length=140)
+            detail = f"พักการซื้อ | {risk_text or 'ติดข้อจำกัดความเสี่ยง'}"
+            if wait_hint:
+                detail = f"{detail} | {wait_hint}"
+            return {"status": "⏸️ พักซื้อ", "detail": self._truncate_ui_text(detail, 180), "color": COLORS["yellow"]}
+
+        detail = f"ยังไม่ซื้อ | {score_text}"
+        if wait_hint:
+            detail = f"{detail} | {wait_hint}"
+        if reason_text:
+            detail = f"{detail} | {reason_text}"
+        return {"status": "⏳ รอซื้อ", "detail": self._truncate_ui_text(detail, 180), "color": COLORS["text_bright"]}
+
+    def _apply_decision_snapshot(self, snapshot: Dict):
+        """Apply the current decision summary to the dashboard widgets."""
+        self.bot_decision_status.set(snapshot.get("status", "—"))
+        self.bot_decision_detail.set(snapshot.get("detail", ""))
+        if hasattr(self, "bot_decision_status_label"):
+            self.bot_decision_status_label.config(fg=snapshot.get("color", COLORS["text_bright"]))
+
+    def _format_llm_status_text(self, advice: Dict, compact: bool = False) -> str:
+        """Build a short UI-friendly LLM status line."""
+        if not self.llm_trade_enabled.get():
+            return "LLM: disabled"
+
+        if advice.get("used"):
+            text = f"LLM {advice.get('action', 'HOLD')} {float(advice.get('confidence', 0.0) or 0.0):.0%}"
+            reason = self._truncate_ui_text(advice.get("reason", ""), 44 if compact else 64)
+            return f"{text} | {reason}" if reason else text
+
+        status = advice.get("status", "unavailable")
+        label_map = {
+            "quota": "LLM quota exceeded",
+            "auth": "LLM invalid API key",
+            "rate_limit": "LLM rate limited",
+            "timeout": "LLM timeout",
+            "backoff": "LLM standby",
+            "error": "LLM unavailable",
+            "unavailable": "LLM standby",
+        }
+        message = label_map.get(status, "LLM standby")
+        if not compact:
+            reason = advice.get("reason", "")
+            if reason and reason not in message:
+                message = f"{message} | {self._truncate_ui_text(reason, 44)}"
+        return message
+
+    def _is_paper_trade_mode(self) -> bool:
+        """Return whether the bot should trade against the simulated portfolio."""
+        return bool(self.paper_trade_enabled.get())
+
+    def _get_live_thb_balance(self) -> float:
+        """Read the currently cached live THB balance."""
+        thb_info = self.wallet_balances.get("THB", {})
+        return float(thb_info.get("available", 0.0) or 0.0)
+
+    def _resolve_paper_start_balance(self, live_balance: float = 0.0) -> float:
+        """Resolve the starting simulated THB balance from config or live wallet."""
+        configured_balance = float(self.config.trading.paper_trade_start_balance_thb or 0.0)
+        if configured_balance > 0:
+            return configured_balance
+        return max(float(live_balance or 0.0), 0.0)
+
+    def _reset_runtime_trade_state(self):
+        """Clear tracked positions and recovery state when switching trading modes."""
+        self.strategy.positions = []
+        self._clear_boss_recovery_state()
+        self._clear_auto_reentry(self.config.trading.symbol)
+        self.last_trade_llm_advice = {}
+        self.last_boss_llm_advice = {}
+
+    def _ensure_paper_balance(self, live_balance: float = 0.0, force_reset: bool = False) -> float:
+        """Initialize or refresh the simulated THB balance."""
+        if force_reset or self.paper_balance_thb <= 0:
+            self.paper_balance_thb = self._resolve_paper_start_balance(live_balance)
+        return self.paper_balance_thb
+
+    def _get_runtime_trade_balance(self, live_balance: Optional[float] = None) -> float:
+        """Return the balance source used by trading decisions."""
+        if self._is_paper_trade_mode():
+            return float(self.paper_balance_thb or 0.0)
+        if live_balance is not None:
+            return float(live_balance or 0.0)
+        return self._get_live_thb_balance()
+
+    def _on_paper_trade_toggle(self, *args):
+        """Prevent mixing live and simulated positions when the mode changes."""
+        if self._paper_toggle_guard:
+            return
+
+        enabled = bool(self.paper_trade_enabled.get())
+        previous_enabled = self._paper_trade_enabled_last
+        if enabled == previous_enabled:
+            return
+
+        if self.bot_running:
+            self._paper_toggle_guard = True
+            self.paper_trade_enabled.set(previous_enabled)
+            self._paper_toggle_guard = False
+            self._log("เปลี่ยนโหมด Live/Paper ระหว่างบอทรันไม่ได้ กรุณาหยุดบอทก่อน", "WARN")
+            return
+
+        self._paper_trade_enabled_last = enabled
+        self.config.trading.paper_trade_enabled = enabled
+        live_balance = self._get_live_thb_balance()
+        self._reset_runtime_trade_state()
+
+        if enabled:
+            seeded_balance = self._ensure_paper_balance(live_balance, force_reset=True)
+            self._log(
+                f"🧪 Paper Trading: ON | เงินจำลองเริ่มต้น ฿{seeded_balance:,.2f} | จะไม่ส่งคำสั่งจริงไป Bitkub",
+                "WARN",
+            )
+        else:
+            self.paper_balance_thb = self._resolve_paper_start_balance(live_balance)
+            self._log("🧪 Paper Trading: OFF | กลับไปใช้ wallet จริงสำหรับคำสั่งถัดไป", "INFO")
+
+        display_balance = self._get_runtime_trade_balance(live_balance)
+        try:
+            current_price = float(self.current_price.get().replace(",", "").split()[0])
+        except (ValueError, IndexError):
+            current_price = 0.0
+        self._update_balance_display(display_balance, current_price)
+        self._update_positions_display(current_price)
+        self._update_pnl_display(current_price)
+        self._refresh_runtime_badges()
+        self._refresh_quick_start_summary()
+
+    def _execute_paper_buy(self, symbol: str, amount_thb: float, price: float,
+                           history_type: str = "P-BUY") -> Optional[Dict[str, float]]:
+        """Execute a simulated buy without sending an exchange order."""
+        if price <= 0:
+            self.root.after(0, self._log, "❌ Paper buy failed: invalid market price", "ERROR")
+            return None
+
+        available_balance = self._ensure_paper_balance(self._get_live_thb_balance())
+        if amount_thb > available_balance:
+            self.root.after(
+                0,
+                self._log,
+                f"❌ Paper buy failed: เงินจำลองไม่พอ (ต้องการ ฿{amount_thb:,.2f} | มี ฿{available_balance:,.2f})",
+                "ERROR",
+            )
+            return None
+
+        buy_fee_rate = max(float(getattr(self.config.trading, "buy_fee_rate", 0.0027) or 0.0), 0.0)
+        crypto_amount = (amount_thb * (1 - buy_fee_rate)) / price
+        self.paper_balance_thb = max(available_balance - amount_thb, 0.0)
+        self.strategy.add_position(
+            symbol,
+            price,
+            crypto_amount,
+            cost_thb=amount_thb,
+            entry_fee_thb=max(amount_thb - (price * crypto_amount), 0.0),
+        )
+        self._clear_boss_recovery_state()
+        self._clear_auto_reentry(symbol)
+        self.root.after(0, self._add_history_entry, history_type, price, 0)
+        self.root.after(0, self._update_pnl_display, price)
+        self.root.after(0, self._update_balance_display, self.paper_balance_thb, price)
+        return {
+            "rate": price,
+            "amount": crypto_amount,
+            "cost_thb": amount_thb,
+        }
+
+    def _execute_paper_sell(self, position: Position, price: float, reason: str,
+                            arm_auto_reentry: bool = True,
+                            history_type: str = "P-SELL") -> Optional[Dict]:
+        """Execute a simulated sell without sending an exchange order."""
+        if price <= 0:
+            self.root.after(0, self._log, "❌ Paper sell failed: invalid market price", "ERROR")
+            return None
+
+        record = self.strategy.close_position(position, price, reason)
+        if not record:
+            return None
+
+        self.paper_balance_thb += float(record.get("net_exit_value_thb", 0.0) or 0.0)
+        self.risk_manager.record_trade_result(record["profit_thb"])
+        if self.bot_running and arm_auto_reentry and reason != "MANUAL_SELL":
+            self._arm_auto_reentry(
+                position.symbol,
+                price,
+                float(record.get("net_exit_value_thb", 0.0) or 0.0),
+                reason,
+            )
+        self.bot_total_realized_pnl += record["profit_thb"]
+        self.bot_total_trades += 1
+        if record["profit_thb"] >= 0:
+            self.bot_win_trades += 1
+        else:
+            self.bot_lose_trades += 1
+        self.root.after(0, self._add_history_entry, history_type, price, record["profit_pct"])
+        self.root.after(0, self._update_pnl_display, price)
+        self.root.after(0, self._update_balance_display, self.paper_balance_thb, price)
+        return record
+
+    def _on_llm_trade_toggle(self, *args):
+        """Handle runtime enable/disable of the LLM trade advisor."""
+        self.config.ai.llm_enabled = bool(self.llm_trade_enabled.get())
+        self.last_trade_llm_advice = {}
+        self.last_boss_llm_advice = {}
+        self._rebuild_llm_advisor()
+        self._sync_llm_trade_status_visual()
+        if self.llm_trade_enabled.get():
+            if getattr(self.config.ai, "openai_api_key", ""):
+                self._log("🧠 LLM Trade Advisor: ON", "SUCCESS")
+            else:
+                self._log("🧠 LLM Trade Advisor เปิดแล้ว แต่ยังไม่มี OPENAI_API_KEY", "WARN")
+        else:
+            self.boss_llm_status.set("LLM: disabled")
+            self.trade_llm_status.set("DISABLED")
+            self._log("🧠 LLM Trade Advisor: OFF", "INFO")
+
     def _update_clock(self):
         """Update the clock in the top bar."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1225,6 +2160,7 @@ class TradingBotGUI:
         self.quick_sell_btn.config(state=tk.NORMAL)
         self._apply_wallet_snapshot(wallet_snapshot, log_success=True)
         self._apply_market_snapshot(market_snapshot)
+        self._refresh_quick_start_summary()
 
     def _handle_connect_error(self, error_message: str):
         """Show connection errors on the Tkinter thread."""
@@ -1233,6 +2169,7 @@ class TradingBotGUI:
         self.connect_btn.config(state=tk.NORMAL, text="🔗 Connect & Load Wallet", bg=COLORS["accent"])
         self.conn_status_label.config(text=f"❌ {error_message}", fg=COLORS["red"])
         self._log(f"Connection error: {error_message}", "ERROR")
+        self._refresh_quick_start_summary()
         messagebox.showerror("Connection Error", error_message)
 
     def _load_wallet(self):
@@ -1392,7 +2329,8 @@ class TradingBotGUI:
             text=f"฿{thb_avail:,.2f}  (รวม: ฿{thb_total:,.2f})",
             fg=COLORS["green"] if thb_avail > 0 else COLORS["red"],
         )
-        self.balance_thb.set(f"{thb_avail:,.2f} THB")
+        runtime_balance = self._get_runtime_trade_balance(thb_avail)
+        self.balance_thb.set(f"{runtime_balance:,.2f} THB")
 
         for item in self.wallet_tree.get_children():
             self.wallet_tree.delete(item)
@@ -1400,9 +2338,13 @@ class TradingBotGUI:
         for row in snapshot.get("wallet_rows", []):
             self.wallet_tree.insert("", "end", values=row)
 
-        self.total_value.set(f"{snapshot.get('total_value_thb', 0):,.2f} THB")
+        if self._is_paper_trade_mode():
+            self._update_balance_display(runtime_balance, 0.0)
+        else:
+            self.total_value.set(f"{snapshot.get('total_value_thb', 0):,.2f} THB")
         self.symbol_combo.config(values=snapshot.get("all_symbols", []))
-        self._sync_selected_position_from_wallet(snapshot, log_sync=log_success)
+        if not self._is_paper_trade_mode():
+            self._sync_selected_position_from_wallet(snapshot, log_sync=log_success)
 
         if log_success:
             self._log(
@@ -1440,6 +2382,7 @@ class TradingBotGUI:
         self.config.trading.symbol = new_symbol
         self._log(f"เปลี่ยนเหรียญเป็น: {new_symbol}", "INFO")
         self._sync_selected_position_from_wallet(log_sync=True)
+        self._refresh_quick_start_summary()
 
         if self.is_connected and self.client:
             # Update price for new symbol
@@ -1463,7 +2406,7 @@ class TradingBotGUI:
             pass
 
     def _quick_buy(self):
-        """Manual buy: place market buy order and register position for bot monitoring."""
+        """Handle quick-buy according to the selected execution mode."""
         if not self.is_connected or not self.client:
             messagebox.showwarning("Not Connected", "กรุณาเชื่อมต่อ Exchange ก่อน")
             return
@@ -1478,21 +2421,52 @@ class TradingBotGUI:
             messagebox.showwarning("Amount Too Low", "จำนวนเงินต่ำสุด 10 THB")
             return
 
-        # Check THB balance
-        thb_info = self.wallet_balances.get("THB", {})
-        thb_avail = thb_info.get("available", 0)
+        mode = self.quick_buy_mode_var.get()
+        if mode == "auto_only":
+            runtime_settings = self._sync_runtime_settings(show_popup=True)
+            if runtime_settings is None:
+                return
+
+            confirm = messagebox.askyesno(
+                "Confirm Auto Buy",
+                (
+                    f"ให้บอทประเมิน BUY {self.config.trading.symbol} หนึ่งรอบทันที\n"
+                    f"วงเงินสูงสุด: ฿{amount_thb:,.2f}\n"
+                    f"โหมด: {'Paper Auto Buy' if self._is_paper_trade_mode() else 'Live Auto Buy'}"
+                ),
+            )
+            if not confirm:
+                return
+
+            self._log(
+                f"🤖 Quick Buy โหมด Auto Trade Only | กำลังให้บอทประเมิน {self.config.trading.symbol} หนึ่งรอบ (budget ฿{amount_thb:,.2f})...",
+                "AI",
+            )
+            threading.Thread(
+                target=self._do_quick_buy_auto_only,
+                args=(self.config.trading.symbol, amount_thb),
+                daemon=True,
+            ).start()
+            return
+
+        thb_avail = self._get_runtime_trade_balance()
         if amount_thb > thb_avail:
             messagebox.showwarning("Insufficient Balance",
                 f"ยอด THB ไม่พอ\nต้องการ: ฿{amount_thb:,.2f}\nมี: ฿{thb_avail:,.2f}")
             return
 
         symbol = self.config.trading.symbol
+        trade_mode = "Paper Buy" if self._is_paper_trade_mode() else "Live Buy"
+        action_text = "ยืนยันจำลองซื้อ" if self._is_paper_trade_mode() else "ยืนยันซื้อ"
         confirm = messagebox.askyesno("Confirm Buy",
-            f"ยืนยันซื้อ {symbol} ด้วยจำนวน ฿{amount_thb:,.2f} THB?")
+            f"{action_text} {symbol} ด้วยจำนวน ฿{amount_thb:,.2f} THB?\nโหมด: {trade_mode}")
         if not confirm:
             return
 
-        self._log(f"📈 กำลังซื้อ {symbol} จำนวน ฿{amount_thb:,.2f}...", "TRADE")
+        if self._is_paper_trade_mode():
+            self._log(f"🧪 กำลังจำลองซื้อ {symbol} จำนวน ฿{amount_thb:,.2f}...", "TRADE")
+        else:
+            self._log(f"📈 กำลังซื้อ {symbol} จำนวน ฿{amount_thb:,.2f}...", "TRADE")
         threading.Thread(target=self._do_quick_buy,
                          args=(symbol, amount_thb), daemon=True).start()
 
@@ -1502,6 +2476,25 @@ class TradingBotGUI:
             # Get current price before order
             ticker = self.client.get_ticker(symbol)
             est_price = ticker.get("last", 0) if ticker else 0
+
+            if self._is_paper_trade_mode():
+                paper_order = self._execute_paper_buy(symbol, amount_thb, est_price)
+                if not paper_order:
+                    return
+
+                exec_price = paper_order["rate"]
+                crypto_amount = paper_order["amount"]
+                self.root.after(
+                    0,
+                    self._log,
+                    f"✅ จำลองซื้อสำเร็จ! {symbol} @ {exec_price:,.2f} THB | จำนวน: {crypto_amount:.8f} | เงินจำลองคงเหลือ: ฿{self.paper_balance_thb:,.2f}",
+                    "SUCCESS",
+                    self._refresh_quick_start_summary()
+                )
+
+                if not self.bot_running:
+                    self.root.after(0, self._auto_start_bot_after_buy)
+                return
 
             order = self.client.create_buy_order(symbol, amount_thb)
 
@@ -1555,30 +2548,111 @@ class TradingBotGUI:
                 pass
 
             # Register position for bot monitoring
-            self.strategy.add_position(symbol, exec_price, crypto_amount)
+            position = self.strategy.add_position(
+                symbol,
+                exec_price,
+                crypto_amount,
+                cost_thb=float(order.get("cost", amount_thb) or amount_thb),
+            )
 
             self.root.after(0, self._log,
                 f"✅ ซื้อสำเร็จ! {symbol} @ {exec_price:,.2f} THB | "
                 f"จำนวน: {crypto_amount:.8f} | "
-                f"SL: {exec_price * (1 - self.config.trading.stop_loss_pct/100):,.2f} | "
-                f"TP: {exec_price * (1 + self.config.trading.take_profit_pct/100):,.2f}",
+                f"SL: {position.stop_loss_price:,.2f} | "
+                f"TP: {position.take_profit_price:,.2f}",
                 "SUCCESS")
             self.root.after(0, self._add_history_entry, "BUY", exec_price, 0)
             self.root.after(0, self._load_wallet)
             self.root.after(0, self._update_pnl_display, exec_price)
 
-            # Auto-start bot if not running
+            # Auto-start bot immediately so the open position is managed by auto trade.
             if not self.bot_running:
-                self.root.after(500, self._auto_start_bot_after_buy)
+                self.root.after(0, self._auto_start_bot_after_buy)
 
         except Exception as e:
             self.root.after(0, self._log, f"❌ Buy error: {e}", "ERROR")
 
+    def _do_quick_buy_auto_only(self, symbol: str, budget_thb: float):
+        """Run one immediate auto-trade buy decision without starting the bot loop."""
+        if not self.data_collector or not self.client:
+            self.root.after(0, self._log, "Quick auto buy ใช้งานไม่ได้ เพราะยังไม่มี market data collector", "ERROR")
+            return
+
+        try:
+            with self._trade_cycle_lock:
+                self.cycle_count += 1
+                df = self.data_collector.fetch_ohlcv(symbol)
+                if df is None or df.empty:
+                    self.root.after(0, self._log, "No market data available for quick auto buy", "WARN")
+                    return
+
+                df_ind = self.indicator_engine.add_all_indicators(df)
+                signals = self.indicator_engine.get_signal_summary(df_ind)
+                current_price = float(signals.get("price", 0.0) or 0.0)
+                if current_price <= 0:
+                    self.root.after(0, self._log, "Quick auto buy ข้ามรอบ เพราะราคาปัจจุบันไม่ถูกต้อง", "WARN")
+                    return
+
+                ai_prediction = self._predict_ai(df_ind)
+                self.root.after(0, self._update_gui_data, signals, ai_prediction)
+
+                balance_detail = self.client.get_balance_detail()
+                self.wallet_balances = balance_detail
+                thb_info = balance_detail.get("THB", {})
+                live_balance = float(thb_info.get("available", 0.0) or 0.0)
+                self.last_thb_balance = live_balance
+                positions = self.strategy.get_open_positions(symbol)
+                balance = self._ensure_paper_balance(live_balance) if self._is_paper_trade_mode() else live_balance
+
+                risk_check = self.risk_manager.can_trade(balance, positions, signals, ai_prediction)
+                action = ""
+                if not risk_check["allowed"]:
+                    guard_reason = risk_check.get("reason", "Risk guard active")
+                    self.root.after(0, self._log, f"🛡️ Quick auto buy ถูกบล็อก | {guard_reason}", "WARN")
+                else:
+                    action = self._check_buy_signal_once(
+                        symbol,
+                        signals,
+                        ai_prediction,
+                        balance,
+                        current_price,
+                        positions,
+                        configured_amount_override=budget_thb,
+                        force_feedback=True,
+                    )
+
+                positions = self.strategy.get_open_positions(symbol)
+
+                decision_snapshot = self._build_decision_snapshot(
+                    symbol,
+                    current_price,
+                    balance,
+                    positions,
+                    signals,
+                    ai_prediction,
+                    action or "HOLD",
+                    risk_check=risk_check,
+                )
+
+            self.root.after(0, lambda: self.bot_cycles_str.set(str(self.cycle_count)))
+            self.root.after(0, lambda snapshot=decision_snapshot: self._apply_decision_snapshot(snapshot))
+            self.root.after(0, self._update_positions_display, current_price)
+            self.root.after(0, self._update_balance_display, balance, current_price)
+            self.root.after(0, self._update_pnl_display, current_price)
+            self.root.after(0, self._update_risk_display, balance)
+            self.root.after(0, self._load_wallet)
+            self.root.after(0, self._refresh_quick_start_summary)
+
+            if not action:
+                self.root.after(0, self._log, "🤖 Quick auto buy จบรอบแล้ว | ยังไม่พบจังหวะซื้อ", "INFO")
+        except Exception as e:
+            self.root.after(0, self._log, f"❌ Quick auto buy error: {e}", "ERROR")
+
     def _auto_start_bot_after_buy(self):
-        """Auto-start bot monitoring after manual buy."""
+        """Start auto trade immediately after a successful quick buy."""
         if self.bot_running:
             return
-        self._log("🤖 เริ่ม Bot อัตโนมัติหลังซื้อเหรียญ...", "INFO")
+        self._log("🤖 Quick Buy สำเร็จ ระบบกำลังเริ่ม auto trade ทันที...", "INFO")
         self._start_bot()
 
     def _quick_sell(self):
@@ -1589,8 +2663,11 @@ class TradingBotGUI:
 
         symbol = self.config.trading.symbol
         coin = symbol.split("_")[0]
-        coin_info = self.wallet_balances.get(coin, {})
-        coin_avail = coin_info.get("available", 0)
+        if self._is_paper_trade_mode():
+            coin_avail = sum(pos.amount for pos in self.strategy.get_open_positions(symbol))
+        else:
+            coin_info = self.wallet_balances.get(coin, {})
+            coin_avail = coin_info.get("available", 0)
 
         if coin_avail <= 0:
             messagebox.showinfo("No Holdings", f"ไม่มี {coin} ในกระเป๋า")
@@ -1604,11 +2681,15 @@ class TradingBotGUI:
             f"ยืนยันขาย {coin} ทั้งหมด?\n"
             f"จำนวน: {coin_avail:.8f} {coin}\n"
             f"ราคาปัจจุบัน: ฿{current_price:,.2f}\n"
-            f"มูลค่าประมาณ: ฿{est_value:,.2f}")
+            f"มูลค่าประมาณ: ฿{est_value:,.2f}\n"
+            f"โหมด: {'Paper Sell' if self._is_paper_trade_mode() else 'Live Sell'}")
         if not confirm:
             return
 
-        self._log(f"📉 กำลังขาย {coin} ทั้งหมด...", "TRADE")
+        if self._is_paper_trade_mode():
+            self._log(f"🧪 กำลังจำลองขาย {coin} ทั้งหมด...", "TRADE")
+        else:
+            self._log(f"📉 กำลังขาย {coin} ทั้งหมด...", "TRADE")
         threading.Thread(target=self._do_quick_sell,
                          args=(symbol, coin_avail, current_price), daemon=True).start()
 
@@ -1623,6 +2704,21 @@ class TradingBotGUI:
                     f"⚠️ ขายไม่ได้เพราะมูลค่ารวมต่ำกว่า 10 THB ({estimated_value:,.2f} THB)",
                     "WARN",
                 )
+                return
+
+            if self._is_paper_trade_mode():
+                positions = self.strategy.get_open_positions(symbol)
+                for pos in list(positions):
+                    record = self._execute_paper_sell(pos, current_price, "MANUAL_SELL", arm_auto_reentry=False)
+                    if record:
+                        self.root.after(
+                            0,
+                            self._log,
+                            f"✅ จำลองขายสำเร็จ! @ {current_price:,.2f} THB | P/L: {record['profit_pct']:+.2f}% | เงินจำลองคงเหลือ: ฿{self.paper_balance_thb:,.2f}",
+                            "SUCCESS",
+                        )
+                if not positions:
+                    self.root.after(0, self._add_history_entry, "P-SELL", current_price, 0)
                 return
 
             order = self.client.create_sell_order(symbol, amount)
@@ -1643,8 +2739,18 @@ class TradingBotGUI:
 
             # Close all open positions for this symbol
             positions = self.strategy.get_open_positions(symbol)
+            total_position_amount = sum(float(pos.amount or 0.0) for pos in positions)
+            total_received_thb = float(order.get("received", 0.0) or 0.0)
             for pos in list(positions):
-                record = self.strategy.close_position(pos, exit_price, "MANUAL_SELL")
+                position_received_thb = 0.0
+                if total_received_thb > 0 and total_position_amount > 0:
+                    position_received_thb = total_received_thb * (float(pos.amount or 0.0) / total_position_amount)
+                record = self.strategy.close_position(
+                    pos,
+                    exit_price,
+                    "MANUAL_SELL",
+                    net_exit_value_thb=position_received_thb if position_received_thb > 0 else None,
+                )
                 if record:
                     self.risk_manager.record_trade_result(record["profit_thb"])
                     # Track bot performance
@@ -1710,8 +2816,10 @@ class TradingBotGUI:
             thb_avail = wallet_snapshot.get("thb_avail", 0)
             coin_info = wallet_snapshot.get("wallet_balances", {}).get(coin, {})
             coin_total = coin_info.get("total", 0)
+            paper_mode = self._is_paper_trade_mode()
+            paper_start_balance = self._resolve_paper_start_balance(thb_avail)
 
-            if thb_avail < 10 and not coin_total:
+            if not paper_mode and thb_avail < 10 and not coin_total:
                 self.root.after(
                     0,
                     self._abort_bot_start,
@@ -1720,20 +2828,28 @@ class TradingBotGUI:
                     "warning",
                 )
                 return
+            if paper_mode and paper_start_balance < 10 and not self.strategy.get_open_positions(symbol):
+                self.root.after(
+                    0,
+                    self._abort_bot_start,
+                    "Paper Balance Too Low",
+                    f"Paper Trading ต้องมียอดเงินจำลองอย่างน้อย 10 THB\nยอดตั้งต้น: ฿{paper_start_balance:,.2f}",
+                    "warning",
+                )
+                return
 
             ticker = self.client.get_ticker(symbol)
             current_price = ticker.get("last", 0) if ticker else 0
             model_messages = []
-            try:
-                self.lstm_predictor.load_model()
+            reload_state = self._reload_saved_ai_models()
+            if reload_state["lstm"] == "saved":
                 model_messages.append(("AI", "LSTM model loaded"))
-            except Exception:
+            else:
                 model_messages.append(("WARN", "LSTM model not found (using signals only)"))
 
-            try:
-                self.rl_agent.load_model()
+            if reload_state["rl"] == "saved":
                 model_messages.append(("AI", "RL model loaded"))
-            except Exception:
+            else:
                 model_messages.append(("WARN", "RL model not found"))
 
             startup_context = {
@@ -1741,7 +2857,14 @@ class TradingBotGUI:
                 "coin": coin,
                 "coin_total": coin_total,
                 "thb_avail": thb_avail,
-                "initial_portfolio_value": thb_avail + (coin_total * current_price),
+                "paper_mode": paper_mode,
+                "paper_start_balance": paper_start_balance,
+                "initial_portfolio_value": (
+                    paper_start_balance + sum(
+                        self.strategy.estimate_exit_value_thb(position.amount, current_price)
+                        for position in self.strategy.get_open_positions(symbol)
+                    )
+                ) if paper_mode else thb_avail + self.strategy.estimate_exit_value_thb(coin_total, current_price),
                 "model_messages": model_messages,
                 "auto_buy_amount": runtime_settings["auto_buy_amount"],
             }
@@ -1752,21 +2875,33 @@ class TradingBotGUI:
     def _finish_start_bot(self, startup_context: Dict[str, object]):
         """Finalize bot startup on the Tkinter thread."""
         self._bot_start_in_progress = False
-        self._sync_selected_position_from_wallet(startup_context["wallet_snapshot"], log_sync=True)
         self._apply_wallet_snapshot(startup_context["wallet_snapshot"], log_success=False)
+        if startup_context.get("paper_mode"):
+            if not self.strategy.get_open_positions(self.config.trading.symbol):
+                self._ensure_paper_balance(startup_context.get("thb_avail", 0.0), force_reset=True)
+            self._log(
+                f"🧪 เริ่ม Bot ในโหมด Paper Trading | เงินจำลอง: ฿{self.paper_balance_thb:,.2f}",
+                "WARN",
+            )
+        else:
+            self._sync_selected_position_from_wallet(startup_context["wallet_snapshot"], log_sync=True)
 
         self.initial_portfolio_value = startup_context["initial_portfolio_value"]
         self.bot_running = True
         self.bot_start_time = datetime.now()
-        self.bot_status.set("🟢 Running")
+        self.bot_status.set("🟢 กำลังทำงาน")
         self.status_label.config(fg=COLORS["green"])
         self.start_btn.config(state=tk.NORMAL, text="⏹ STOP BOT", bg=COLORS["red"])
-        self.bot_alive_label.config(text="🟢 RUNNING", fg=COLORS["green"])
+        self.bot_alive_label.config(text="🟢 กำลังทำงาน", fg=COLORS["green"])
         self._start_uptime_timer()
         self._log("Bot STARTED", "SUCCESS")
         self._log(f"  เหรียญ: {self.config.trading.symbol}", "INFO")
         self._log(
-            f"  THB Available: ฿{startup_context['thb_avail']:,.2f} | {startup_context['coin']}: {startup_context['coin_total']:.8g}",
+            (
+                f"  Paper Balance: ฿{self.paper_balance_thb:,.2f}"
+                if startup_context.get("paper_mode")
+                else f"  THB Available: ฿{startup_context['thb_avail']:,.2f} | {startup_context['coin']}: {startup_context['coin_total']:.8g}"
+            ),
             "INFO",
         )
         self._log(f"  Interval: {self.config.trading.trading_interval_seconds}s", "INFO")
@@ -1851,6 +2986,7 @@ class TradingBotGUI:
         self.config.trading.ai_take_profit_enabled = self.ai_take_profit_enabled.get()
         self.config.trading.ai_take_profit_min_profit_pct = ai_take_profit_pct
         self.config.trading.symbol = applied_symbol
+        self.config.trading.paper_trade_enabled = self.paper_trade_enabled.get()
 
         snapshot = {
             "symbol": applied_symbol,
@@ -1863,6 +2999,7 @@ class TradingBotGUI:
             "ai_take_profit_enabled": self.config.trading.ai_take_profit_enabled,
             "ai_take_profit_pct": ai_take_profit_pct,
             "boss_mode": self.boss_mode.get(),
+            "paper_trade_enabled": self.paper_trade_enabled.get(),
             "boss_cutloss": float(self.boss_cutloss_pct_var.get()),
             "boss_recovery": float(self.boss_recovery_pct_var.get()),
             "reentry_enabled": self.auto_reentry_enabled.get(),
@@ -1874,7 +3011,7 @@ class TradingBotGUI:
             self.root.after(
                 0,
                 self._log,
-                f"อัปเดตพารามิเตอร์สด | Interval {interval}s | SL {stop_loss_pct}% | TP {take_profit_pct}% | Auto Buy ฿{auto_buy_amount:,.2f}",
+                f"อัปเดตพารามิเตอร์สด | Interval {interval}s | SL {stop_loss_pct}% | TP {take_profit_pct}% | Auto Buy ฿{auto_buy_amount:,.2f} | Mode {'PAPER' if self.paper_trade_enabled.get() else 'LIVE'}",
                 "INFO",
             )
 
@@ -1891,12 +3028,13 @@ class TradingBotGUI:
     def _stop_bot(self):
         """Stop the auto trading loop."""
         self.bot_running = False
-        self.bot_status.set("⏹ Stopped")
+        self.bot_status.set("⏹ หยุดอยู่")
         self.status_label.config(fg=COLORS["yellow"])
         self.start_btn.config(text="▶ START BOT", bg=COLORS["green"])
-        self.bot_alive_label.config(text="⏹ STOPPED", fg=COLORS["red"])
+        self.bot_alive_label.config(text="⏹ หยุดอยู่", fg=COLORS["red"])
         self._log("Bot STOPPED", "WARN")
         self._refresh_runtime_badges()
+        self._refresh_quick_start_summary()
 
     def _trading_loop(self):
         """Background trading loop (runs in thread)."""
@@ -1923,81 +3061,100 @@ class TradingBotGUI:
         if not self.data_collector or not self.client:
             return
 
-        self.cycle_count += 1
-        symbol = self.config.trading.symbol
+        with self._trade_cycle_lock:
+            self.cycle_count += 1
+            symbol = self.config.trading.symbol
 
-        # Step 1: Fetch data
-        df = self.data_collector.fetch_ohlcv(symbol)
-        if df is None or df.empty:
-            self.root.after(0, self._log, "No market data available", "WARN")
-            return
+            # Step 1: Fetch data
+            df = self.data_collector.fetch_ohlcv(symbol)
+            if df is None or df.empty:
+                self.root.after(0, self._log, "No market data available", "WARN")
+                return
 
-        # Step 2: Calculate indicators
-        df_ind = self.indicator_engine.add_all_indicators(df)
-        signals = self.indicator_engine.get_signal_summary(df_ind)
+            # Step 2: Calculate indicators
+            df_ind = self.indicator_engine.add_all_indicators(df)
+            signals = self.indicator_engine.get_signal_summary(df_ind)
 
-        current_price = signals.get("price", 0)
-        if current_price <= 0:
-            return
+            current_price = signals.get("price", 0)
+            if current_price <= 0:
+                return
 
-        # Step 3: AI prediction
-        ai_prediction = self.lstm_predictor.predict(df_ind)
+            # Step 3: AI prediction
+            ai_prediction = self._predict_ai(df_ind)
 
-        # Step 4: Update GUI
-        self.root.after(0, self._update_gui_data, signals, ai_prediction)
+            # Step 4: Update GUI
+            self.root.after(0, self._update_gui_data, signals, ai_prediction)
 
-        # Step 5: Get REAL balance from exchange
-        balance_detail = self.client.get_balance_detail()
-        self.wallet_balances = balance_detail
-        thb_info = balance_detail.get("THB", {})
-        balance = thb_info.get("available", 0.0)
-        positions = self.strategy.get_open_positions(symbol)
+            # Step 5: Get balance snapshot
+            balance_detail = self.client.get_balance_detail()
+            self.wallet_balances = balance_detail
+            thb_info = balance_detail.get("THB", {})
+            live_balance = float(thb_info.get("available", 0.0) or 0.0)
+            self.last_thb_balance = live_balance
+            positions = self.strategy.get_open_positions(symbol)
+            if self._is_paper_trade_mode():
+                balance = self._ensure_paper_balance(live_balance)
+            else:
+                balance = live_balance
 
-        # Refresh wallet display every 5 cycles
-        if self.cycle_count % 5 == 0:
-            self.root.after(0, self._load_wallet)
+            # Refresh wallet display every 5 cycles
+            if self.cycle_count % 5 == 0:
+                self.root.after(0, self._load_wallet)
 
-        # Step 6: Boss Mode or normal SL/TP
-        if self.boss_mode.get():
-            action = self._check_boss_mode(symbol, current_price, balance, signals, df_ind, ai_prediction)
-        else:
-            action = self._check_sl_tp(symbol, current_price, balance, signals, df_ind, ai_prediction)
+            risk_check = None
 
-        if not action and positions:
-            action = self._check_ai_scale_in(
-                symbol, current_price, balance, positions, signals, ai_prediction, df_ind
-            )
+            # Step 6: Boss Mode or normal SL/TP
+            if self.boss_mode.get():
+                action = self._check_boss_mode(symbol, current_price, balance, signals, df_ind, ai_prediction)
+            else:
+                action = self._check_sl_tp(symbol, current_price, balance, signals, df_ind, ai_prediction)
 
-        # Step 7: If we recently sold this symbol, monitor for auto re-entry
-        if not action:
-            action = self._check_auto_reentry(
-                symbol, current_price, balance, positions, signals, ai_prediction
-            )
-
-        # Step 8: If no SL/TP, re-entry, or Boss action, check signals
-        if not action:
-            risk_check = self.risk_manager.can_trade(balance, positions)
-            if risk_check["allowed"]:
-                action = self._check_signals(
-                    symbol, signals, ai_prediction, balance, current_price
+            if not action and positions:
+                action = self._check_ai_scale_in(
+                    symbol, current_price, balance, positions, signals, ai_prediction, df_ind
                 )
 
-        action_name = action or "HOLD"
-        self.root.after(0, self._log,
-                        f"Cycle #{self.cycle_count} | {symbol} @ {current_price:,.2f} | "
-                        f"THB: ฿{balance:,.2f} | {action_name}",
-                        "TRADE" if action else "INFO")
+            # Step 7: If we recently sold this symbol, monitor for auto re-entry
+            if not action:
+                action = self._check_auto_reentry(
+                    symbol, current_price, balance, positions, signals, ai_prediction
+                )
 
-        # Update last action
-        self.root.after(0, lambda a=action_name: self.bot_last_action.set(a))
-        self.root.after(0, lambda: self.bot_cycles_str.set(str(self.cycle_count)))
+            # Step 8: If no SL/TP, re-entry, or Boss action, check signals
+            if not action:
+                risk_check = self.risk_manager.can_trade(balance, positions, signals, ai_prediction)
+                if risk_check["allowed"]:
+                    action = self._check_signals(
+                        symbol, signals, ai_prediction, balance, current_price
+                    )
 
-        # Update positions, balance, P/L, and risk
-        self.root.after(0, self._update_positions_display, current_price)
-        self.root.after(0, self._update_balance_display, balance, current_price)
-        self.root.after(0, self._update_pnl_display, current_price)
-        self.root.after(0, self._update_risk_display, balance)
-        self.root.after(0, self._update_bot_performance, current_price)
+            action_name = action or "HOLD"
+            decision_snapshot = self._build_decision_snapshot(
+                symbol,
+                current_price,
+                balance,
+                positions,
+                signals,
+                ai_prediction,
+                action_name,
+                risk_check=risk_check,
+            )
+            self.root.after(0, self._log,
+                            f"Cycle #{self.cycle_count} | {symbol} @ {current_price:,.2f} | "
+                            f"{'PAPER' if self._is_paper_trade_mode() else 'THB'}: ฿{balance:,.2f} | {action_name}",
+                            "TRADE" if action else "INFO")
+
+            # Update last action
+            self.root.after(0, lambda a=action_name: self.bot_last_action.set(a))
+            self.root.after(0, lambda: self.bot_cycles_str.set(str(self.cycle_count)))
+            self.root.after(0, lambda snapshot=decision_snapshot: self._apply_decision_snapshot(snapshot))
+
+            # Update positions, balance, P/L, and risk
+            self.root.after(0, self._update_positions_display, current_price)
+            self.root.after(0, self._update_balance_display, balance, current_price)
+            self.root.after(0, self._update_pnl_display, current_price)
+            self.root.after(0, self._update_risk_display, balance)
+            self.root.after(0, self._update_bot_performance, current_price)
 
     def _on_boss_toggle(self, *args):
         """Handle boss mode toggle."""
@@ -2012,15 +3169,67 @@ class TradingBotGUI:
     def _build_rl_live_decision(self, df_ind, position: Position) -> Dict:
         """Build the RL live decision for the current position."""
         try:
-            state = self.rl_agent.build_live_state(
+            _, rl_agent = self._get_ai_models()
+            state = rl_agent.build_live_state(
                 df_ind, has_position=True, entry_price=position.entry_price
             )
             if state is None:
                 return {}
-            return self.rl_agent.decide(state)
+            return rl_agent.decide(state)
         except Exception as e:
             self.root.after(0, self._log, f"RL live decision error: {e}", "ERROR")
             return {}
+
+    def _get_ai_models(self):
+        """Return a consistent snapshot of the active AI models."""
+        with self._ai_model_lock:
+            return self.lstm_predictor, self.rl_agent
+
+    def _predict_ai(self, df_ind) -> Dict:
+        """Run LSTM prediction using the currently committed model."""
+        lstm_predictor, _ = self._get_ai_models()
+        return lstm_predictor.predict(df_ind)
+
+    def _commit_ai_models(self, lstm_predictor: Optional[LSTMPredictor] = None,
+                          rl_agent: Optional[RLTradingAgent] = None):
+        """Atomically swap the AI models used by auto trade."""
+        with self._ai_model_lock:
+            if lstm_predictor is not None:
+                self.lstm_predictor = lstm_predictor
+            if rl_agent is not None:
+                self.rl_agent = rl_agent
+
+    def _reload_saved_ai_models(self, df_ind=None) -> Dict[str, str]:
+        """Load the persisted AI models and make them active for auto trade."""
+        lstm_source = "unchanged"
+        rl_source = "unchanged"
+        reloaded_lstm = None
+        reloaded_rl = None
+
+        try:
+            candidate_lstm = LSTMPredictor(self.config.ai, self.logger)
+            candidate_lstm.load_model(df_ind)
+            if candidate_lstm.model is not None:
+                reloaded_lstm = candidate_lstm
+                lstm_source = "saved"
+        except Exception as e:
+            self.root.after(0, self._log, f"LSTM reload failed: {e}", "WARN")
+
+        try:
+            candidate_rl = RLTradingAgent(self.config.ai, logger=self.logger)
+            if candidate_rl.load_model():
+                reloaded_rl = candidate_rl
+                rl_source = "saved"
+        except Exception as e:
+            self.root.after(0, self._log, f"RL reload failed: {e}", "WARN")
+
+        if reloaded_lstm is not None or reloaded_rl is not None:
+            self._commit_ai_models(reloaded_lstm, reloaded_rl)
+
+        return {
+            "lstm": lstm_source,
+            "rl": rl_source,
+        }
 
     def _get_auto_buy_amount(self) -> float:
         """Get the configured auto-buy amount from the GUI."""
@@ -2057,18 +3266,327 @@ class TradingBotGUI:
             "change_from_exit_pct": change_from_exit_pct,
         }
 
+    def _update_recovery_confirmation(self, current_price: float, trigger_price: float,
+                                      confirm_count: int, required_confirm_cycles: int,
+                                      buffer_pct: float, low_updated: bool) -> Dict:
+        """Require the market to hold above the trigger before rebuying."""
+        effective_trigger = trigger_price * (1 + max(buffer_pct, 0.0) / 100) if trigger_price > 0 else 0.0
+
+        if low_updated or current_price < effective_trigger:
+            confirm_count = 0
+        else:
+            confirm_count += 1
+
+        return {
+            "confirm_count": confirm_count,
+            "required_confirm_cycles": max(required_confirm_cycles, 1),
+            "effective_trigger": effective_trigger,
+            "confirmed": confirm_count >= max(required_confirm_cycles, 1),
+        }
+
+    def _get_rebuy_target_price(self, exit_price: float, recovery_pct: float,
+                                buffer_pct: float = 0.0,
+                                low_price: Optional[float] = None) -> float:
+        """Compute the effective re-buy trigger price for GUI and log text."""
+        reference_price = low_price if low_price is not None and low_price > 0 else exit_price
+        if reference_price <= 0:
+            return 0.0
+
+        tracker = self._update_recovery_tracker(
+            exit_price,
+            reference_price,
+            reference_price,
+            recovery_pct,
+        )
+        confirmation = self._update_recovery_confirmation(
+            reference_price,
+            tracker["trigger_price"],
+            0,
+            1,
+            buffer_pct,
+            False,
+        )
+        return float(confirmation["effective_trigger"])
+
+    @staticmethod
+    def _blend_numeric_advice(base_value: float, suggested_value: Optional[float], weight: float = 0.55) -> float:
+        if suggested_value is None:
+            return base_value
+        return (base_value * (1 - weight)) + (suggested_value * weight)
+
+    def _request_boss_llm_advice(self, stage: str, symbol: str, current_price: float,
+                                 balance: float, signals: Dict, ai_prediction: Dict,
+                                 adaptive_profile: Dict, position: Optional[Position] = None,
+                                 tracker: Optional[Dict] = None, pnl_pct: float = 0.0,
+                                 pnl_thb: float = 0.0) -> Dict:
+        context = {
+            "symbol": symbol,
+            "current_price": round(float(current_price or 0.0), 8),
+            "balance_thb": round(float(balance or 0.0), 2),
+            "pnl_pct": round(float(pnl_pct or 0.0), 4),
+            "pnl_thb": round(float(pnl_thb or 0.0), 2),
+            "position_entry_price": round(float(position.entry_price), 8) if position else None,
+            "position_amount": round(float(position.amount), 8) if position else None,
+            "adaptive_profile": {
+                "cutloss_pct": round(float(adaptive_profile.get("cutloss_pct", 0.0) or 0.0), 4),
+                "hard_limit_pct": round(float(adaptive_profile.get("hard_limit_pct", 0.0) or 0.0), 4),
+                "recovery_pct": round(float(adaptive_profile.get("recovery_pct", 0.0) or 0.0), 4),
+                "rebuy_allocation_pct": round(float(adaptive_profile.get("rebuy_allocation_pct", 0.0) or 0.0), 2),
+            },
+            "signals": {
+                "rsi": round(float(signals.get("rsi", 0.0) or 0.0), 2),
+                "volume_ratio": round(float(signals.get("volume_ratio", 0.0) or 0.0), 4),
+                "trend_down": bool(signals.get("trend_down", False)),
+                "macd_bearish": bool(signals.get("macd_bearish", False)),
+                "support_level": round(float(signals.get("support_level", 0.0) or 0.0), 8),
+                "resistance_level": round(float(signals.get("resistance_level", 0.0) or 0.0), 8),
+                "atr_pct": round(float(signals.get("atr_pct", 0.0) or 0.0), 4),
+            },
+            "ai": {
+                "direction": ai_prediction.get("direction", "unknown"),
+                "confidence": round(float(ai_prediction.get("confidence", 0.0) or 0.0), 4),
+                "price_change_pct": round(float(ai_prediction.get("price_change_pct", 0.0) or 0.0), 4),
+                "predicted_price": round(float(ai_prediction.get("predicted_price", 0.0) or 0.0), 8),
+            },
+        }
+        if tracker:
+            context["recovery"] = {
+                "low_price": round(float(tracker.get("low_price", 0.0) or 0.0), 8),
+                "trigger_price": round(float(tracker.get("trigger_price", 0.0) or 0.0), 8),
+                "recovery_from_low_pct": round(float(tracker.get("recovery_from_low_pct", 0.0) or 0.0), 4),
+                "change_from_exit_pct": round(float(tracker.get("change_from_exit_pct", 0.0) or 0.0), 4),
+            }
+
+        advice = self.llm_boss_advisor.review_boss_action(stage, context)
+        advice["stage"] = stage
+        self.last_boss_llm_advice = advice
+        self.boss_llm_status.set(self._format_llm_status_text(advice))
+
+        self._sync_llm_trade_status_visual()
+
+        return advice
+
+    def _request_trade_llm_advice(self, stage: str, symbol: str, current_price: float,
+                                  balance: float, signals: Dict, ai_prediction: Dict,
+                                  position: Optional[Position] = None,
+                                  reasons: Optional[list] = None,
+                                  signal_score: float = 0.0) -> Dict:
+        context = {
+            "symbol": symbol,
+            "current_price": round(float(current_price or 0.0), 8),
+            "balance_thb": round(float(balance or 0.0), 2),
+            "signal_score": round(float(signal_score or 0.0), 4),
+            "position_entry_price": round(float(position.entry_price), 8) if position else None,
+            "position_amount": round(float(position.amount), 8) if position else None,
+            "signals": {
+                "rsi": round(float(signals.get("rsi", 0.0) or 0.0), 2),
+                "trend_down": bool(signals.get("trend_down", False)),
+                "macd_bearish": bool(signals.get("macd_bearish", False)),
+                "support_level": round(float(signals.get("support_level", 0.0) or 0.0), 8),
+                "resistance_level": round(float(signals.get("resistance_level", 0.0) or 0.0), 8),
+                "volume_ratio": round(float(signals.get("volume_ratio", 0.0) or 0.0), 4),
+            },
+            "ai": {
+                "direction": ai_prediction.get("direction", "unknown"),
+                "confidence": round(float(ai_prediction.get("confidence", 0.0) or 0.0), 4),
+                "price_change_pct": round(float(ai_prediction.get("price_change_pct", 0.0) or 0.0), 4),
+                "predicted_price": round(float(ai_prediction.get("predicted_price", 0.0) or 0.0), 8),
+            },
+            "reasons": reasons or [],
+        }
+        constraints = {
+            "stage": stage,
+            "prefer": "risk_reduction and clear trend confirmation",
+        }
+        advice = self.llm_boss_advisor.review_trade_action(stage, context, constraints)
+        self.last_trade_llm_advice = advice
+        if advice.get("used"):
+            self.trade_llm_status.set(
+                f"{advice.get('action', 'HOLD')} {advice.get('confidence', 0.0):.0%}"
+            )
+        elif self.llm_boss_advisor.is_enabled():
+            self.trade_llm_status.set(self._format_llm_status_text(advice, compact=True))
+        else:
+            self.trade_llm_status.set("LLM trade: disabled")
+        self._sync_llm_trade_status_visual()
+        return advice
+
+    def _apply_trade_llm_gate(self, advice: Dict, allow_action: str, block_action: str) -> Dict:
+        min_conf = float(getattr(self.config.ai, "llm_override_min_confidence", 0.68) or 0.68)
+        confidence = float(advice.get("confidence", 0.0) or 0.0)
+        action = advice.get("action")
+        return {
+            "allow": advice.get("used") and action == allow_action and confidence >= min_conf,
+            "block": advice.get("used") and action == block_action and confidence >= min_conf,
+            "confidence": confidence,
+            "reason": advice.get("reason", ""),
+        }
+
+    def _llm_is_confident(self, advice: Dict, expected_action: str) -> bool:
+        min_conf = float(getattr(self.config.ai, "llm_override_min_confidence", 0.68) or 0.68)
+        return (
+            advice.get("used")
+            and advice.get("action") == expected_action
+            and float(advice.get("confidence", 0.0) or 0.0) >= min_conf
+        )
+
+    def _get_runtime_position_summary(self, current_price: float) -> Dict[str, float | int | str]:
+        """Summarize the open position for the currently selected symbol."""
+        symbol = self.config.trading.symbol
+        positions = self.strategy.get_open_positions(symbol)
+        if not positions or current_price <= 0:
+            return {
+                "count": 0,
+                "amount": 0.0,
+                "avg_entry": 0.0,
+                "pnl_thb": 0.0,
+                "pnl_pct": 0.0,
+                "label": "ยังไม่มี position เปิดอยู่",
+            }
+
+        total_amount = sum(float(pos.amount or 0.0) for pos in positions)
+        total_cost = sum(float(pos.entry_cost_thb or 0.0) for pos in positions)
+        pnl_thb = sum(self.strategy.get_position_pnl(pos, current_price)["profit_thb"] for pos in positions)
+        avg_entry = (total_cost / total_amount) if total_amount > 0 else 0.0
+        pnl_pct = (pnl_thb / total_cost * 100) if total_cost > 0 else 0.0
+        side_text = "กำไร" if pnl_thb >= 0 else "ขาดทุน"
+        return {
+            "count": len(positions),
+            "amount": total_amount,
+            "avg_entry": avg_entry,
+            "pnl_thb": pnl_thb,
+            "pnl_pct": pnl_pct,
+            "label": f"ถือ {total_amount:.6g} | ต้นทุนเฉลี่ย {avg_entry:,.2f} | {side_text} {abs(pnl_thb):,.2f} THB ({pnl_pct:+.2f}%)",
+        }
+
+    def _get_boss_runtime_snapshot(self, current_price: float) -> Dict:
+        """Build realtime Boss or Auto Re-Buy details for the GUI."""
+        if self.boss_mode.get() and self.boss_waiting_recovery and self.boss_last_sell_price > 0:
+            base_recovery_pct = 0.5
+            try:
+                base_recovery_pct = float(self.boss_recovery_pct_var.get())
+            except ValueError:
+                pass
+
+            adaptive_profile = self.strategy.get_adaptive_risk_profile(
+                self.last_signals,
+                self.last_ai_prediction,
+                base_recovery_pct=base_recovery_pct,
+            )
+            recovery_pct = adaptive_profile["recovery_pct"]
+            allocation_pct = adaptive_profile["rebuy_allocation_pct"]
+            tracker = self._update_recovery_tracker(
+                self.boss_last_sell_price,
+                current_price,
+                self.boss_recovery_low_price,
+                recovery_pct,
+            )
+            confirm_required = max(getattr(self.config.trading, "boss_recovery_confirm_cycles", 2), 1)
+            cooldown_cycles = max(getattr(self.config.trading, "boss_recovery_cooldown_cycles", 1), 0)
+            trigger_buffer_pct = max(getattr(self.config.trading, "reentry_trigger_buffer_pct", 0.05), 0.0)
+            confirmation = self._update_recovery_confirmation(
+                current_price,
+                tracker["trigger_price"],
+                self.boss_recovery_confirm_count,
+                confirm_required,
+                trigger_buffer_pct,
+                False,
+            )
+            cycles_waited = max(self.cycle_count - self.boss_recovery_sell_cycle, 0)
+            cooldown_left = max(cooldown_cycles - cycles_waited, 0)
+            target_budget = self.boss_rebuy_budget_thb or self.last_thb_balance
+            buy_budget = min(
+                self.last_thb_balance * min(allocation_pct / 100, 0.95),
+                target_budget * (allocation_pct / 100),
+            )
+            return {
+                "title": "🏆 Boss รอซื้อคืน",
+                "color": COLORS["yellow"],
+                "detail": (
+                    f"ราคา Re-Buy {confirmation['effective_trigger']:,.2f} | ตอนนี้ {current_price:,.2f} | ขาย {self.boss_last_sell_price:,.2f} | low {self.boss_recovery_low_price:,.2f}\n"
+                    f"ฟื้น {tracker['recovery_from_low_pct']:+.2f}% | confirm {self.boss_recovery_confirm_count}/{confirm_required} | cooldown {cooldown_left} | งบ ฿{buy_budget:,.0f} | {self._truncate_ui_text(self.boss_llm_status.get(), 58)}"
+                ),
+            }
+
+        if self.reentry_waiting and self.reentry_symbol:
+            base_rise_pct = 0.5
+            try:
+                base_rise_pct = float(self.reentry_rise_pct_var.get())
+            except ValueError:
+                pass
+
+            adaptive_profile = self.strategy.get_adaptive_risk_profile(
+                self.last_signals,
+                self.last_ai_prediction,
+                base_recovery_pct=base_rise_pct,
+            )
+            recovery_pct = adaptive_profile["recovery_pct"]
+            allocation_pct = adaptive_profile["rebuy_allocation_pct"]
+            tracker = self._update_recovery_tracker(
+                self.reentry_last_exit_price,
+                current_price,
+                self.reentry_recovery_low_price,
+                recovery_pct,
+            )
+            confirm_required = max(getattr(self.config.trading, "reentry_confirm_cycles", 2), 1)
+            cooldown_cycles = max(getattr(self.config.trading, "reentry_cooldown_cycles", 1), 0)
+            trigger_buffer_pct = max(getattr(self.config.trading, "reentry_trigger_buffer_pct", 0.05), 0.0)
+            confirmation = self._update_recovery_confirmation(
+                current_price,
+                tracker["trigger_price"],
+                self.reentry_confirm_count,
+                confirm_required,
+                trigger_buffer_pct,
+                False,
+            )
+            cycles_waited = max(self.cycle_count - self.reentry_sell_cycle, 0)
+            cooldown_left = max(cooldown_cycles - cycles_waited, 0)
+            buy_budget = min(
+                self.last_thb_balance * min(allocation_pct / 100, 0.95),
+                self.reentry_budget_thb * (allocation_pct / 100),
+            )
+            return {
+                "title": f"🔁 Re-Buy รอ {self.reentry_symbol}",
+                "color": COLORS["accent"],
+                "detail": (
+                    f"ราคา Re-Buy {confirmation['effective_trigger']:,.2f} | ตอนนี้ {current_price:,.2f} | ขาย {self.reentry_last_exit_price:,.2f} | low {self.reentry_recovery_low_price:,.2f}\n"
+                    f"ฟื้น {tracker['recovery_from_low_pct']:+.2f}% | confirm {self.reentry_confirm_count}/{confirm_required} | cooldown {cooldown_left} | งบ ฿{buy_budget:,.0f} | {self._truncate_ui_text(self.boss_llm_status.get(), 58)}"
+                ),
+            }
+
+        if self.boss_mode.get():
+            position_summary = self._get_runtime_position_summary(current_price)
+            return {
+                "title": "🏆 Boss พร้อมทำงาน",
+                "color": COLORS["green"],
+                "detail": (
+                    f"ราคาปัจจุบัน {current_price:,.2f} | {position_summary['label']}\n"
+                    f"{self._truncate_ui_text(self.boss_llm_status.get(), 92)}"
+                ),
+            }
+
+        return {
+            "title": "Boss: OFF",
+            "color": COLORS["text_dim"],
+            "detail": f"ราคาปัจจุบัน {current_price:,.2f}",
+        }
+
     def _clear_boss_recovery_state(self):
         """Reset pending boss buy-back recovery tracking."""
         self.boss_waiting_recovery = False
         self.boss_last_sell_price = 0.0
         self.boss_recovery_low_price = 0.0
         self.boss_rebuy_budget_thb = 0.0
+        self.boss_recovery_sell_cycle = 0
+        self.boss_recovery_confirm_count = 0
 
     def _arm_boss_recovery_state(self, exit_price: float, budget_thb: float):
         """Store recovery tracking state after a boss cutloss sell."""
         self.boss_last_sell_price = exit_price
         self.boss_recovery_low_price = exit_price
         self.boss_rebuy_budget_thb = max(budget_thb, 0.0)
+        self.boss_recovery_sell_cycle = self.cycle_count
+        self.boss_recovery_confirm_count = 0
         self.boss_waiting_recovery = True
 
     def _check_ai_scale_in(self, symbol: str, current_price: float, balance: float,
@@ -2077,13 +3595,13 @@ class TradingBotGUI:
         if not positions or not self.config.trading.ai_scale_in_enabled:
             return ""
 
-        risk_check = self.risk_manager.can_trade(balance, positions)
+        risk_check = self.risk_manager.can_trade(balance, positions, signals, ai_prediction)
         if not risk_check["allowed"]:
             return ""
 
         representative_position = min(
             positions,
-            key=lambda pos: (current_price - pos.entry_price) / pos.entry_price if pos.entry_price else 0,
+            key=lambda pos: self.strategy.get_position_pnl(pos, current_price)["profit_pct"],
         )
         rl_decision = self._build_rl_live_decision(df_ind, representative_position)
         scale_in = self.strategy.evaluate_ai_scale_in(
@@ -2107,7 +3625,11 @@ class TradingBotGUI:
             return "INVALID_SCALE_IN"
 
         sizing = self.risk_manager.calculate_position_size(
-            balance, current_price, scale_in["signal_strength"]
+            balance,
+            current_price,
+            scale_in["signal_strength"],
+            signals,
+            ai_prediction,
         )
         buy_amount = min(configured_amount, sizing["position_size_thb"], balance * 0.95)
         if buy_amount < 10:
@@ -2143,6 +3665,9 @@ class TradingBotGUI:
         cutloss_pct = adaptive_profile["cutloss_pct"]
         recovery_pct = adaptive_profile["recovery_pct"]
         rebuy_allocation_pct = adaptive_profile["rebuy_allocation_pct"]
+        boss_cooldown_cycles = max(getattr(self.config.trading, "boss_recovery_cooldown_cycles", 1), 0)
+        boss_confirm_cycles = max(getattr(self.config.trading, "boss_recovery_confirm_cycles", 2), 1)
+        trigger_buffer_pct = max(getattr(self.config.trading, "reentry_trigger_buffer_pct", 0.05), 0.0)
 
         # Wait for price recovery after a boss cutloss before buying back.
         if self.boss_waiting_recovery and self.boss_last_sell_price > 0:
@@ -2153,9 +3678,71 @@ class TradingBotGUI:
                 self.boss_recovery_low_price,
                 recovery_pct,
             )
+            llm_advice = self._request_boss_llm_advice(
+                "recovery",
+                symbol,
+                current_price,
+                balance,
+                signals,
+                ai_prediction,
+                adaptive_profile,
+                tracker=tracker,
+            )
+            recovery_pct = max(
+                self.config.trading.adaptive_rebuy_floor_pct,
+                min(
+                    self.config.trading.adaptive_rebuy_ceiling_pct,
+                    self._blend_numeric_advice(recovery_pct, llm_advice.get("recovery_pct")),
+                ),
+            )
+            rebuy_allocation_pct = max(
+                self.config.trading.adaptive_rebuy_min_allocation_pct,
+                min(
+                    self.config.trading.adaptive_rebuy_max_allocation_pct,
+                    self._blend_numeric_advice(rebuy_allocation_pct, llm_advice.get("allocation_pct"), weight=0.45),
+                ),
+            )
+            tracker = self._update_recovery_tracker(
+                exit_price,
+                current_price,
+                self.boss_recovery_low_price,
+                recovery_pct,
+            )
             self.boss_recovery_low_price = tracker["low_price"]
+            pending_rebuy_price = self._get_rebuy_target_price(
+                exit_price,
+                recovery_pct,
+                trigger_buffer_pct,
+                self.boss_recovery_low_price,
+            )
+            cycles_waited = max(self.cycle_count - self.boss_recovery_sell_cycle, 0)
 
-            if tracker["recovery_from_low_pct"] >= recovery_pct:
+            if cycles_waited < boss_cooldown_cycles:
+                self.boss_recovery_confirm_count = 0
+                if self.cycle_count % 3 == 0:
+                    self.root.after(0, self._log,
+                        f"🏆 Boss cooldown หลังขาย | รออีก {boss_cooldown_cycles - cycles_waited} รอบ | "
+                        f"low หลังขาย {self.boss_recovery_low_price:,.2f} | ราคา Re-Buy {pending_rebuy_price:,.2f}",
+                        "INFO")
+                return ""
+
+            confirmation = self._update_recovery_confirmation(
+                current_price,
+                tracker["trigger_price"],
+                self.boss_recovery_confirm_count,
+                boss_confirm_cycles,
+                trigger_buffer_pct,
+                tracker["low_updated"],
+            )
+            self.boss_recovery_confirm_count = confirmation["confirm_count"]
+
+            if tracker["recovery_from_low_pct"] >= recovery_pct and confirmation["confirmed"]:
+                if self._llm_is_confident(llm_advice, "WAIT") or self._llm_is_confident(llm_advice, "HOLD"):
+                    if self.cycle_count % 3 == 0:
+                        self.root.after(0, self._log,
+                            f"🏆 Boss ชะลอ buy-back ตาม LLM | {llm_advice.get('reason', '')}",
+                            "AI")
+                    return ""
                 # Price recovered enough above the cutloss exit -> buy back.
                 target_budget = self.boss_rebuy_budget_thb or balance
                 buy_amount = min(
@@ -2182,7 +3769,8 @@ class TradingBotGUI:
                         f"🏆 Boss รอราคาฟื้นเพื่อซื้อคืน | ราคา: {current_price:,.2f} | "
                         f"จุดขาย: {exit_price:,.2f} | low หลังขาย: {self.boss_recovery_low_price:,.2f} | "
                         f"ฟื้นจาก low: {tracker['recovery_from_low_pct']:+.2f}% "
-                        f"(AI เป้าฟื้น: +{recovery_pct:.2f}% | trigger {tracker['trigger_price']:,.2f})",
+                        f"(AI เป้าฟื้น: +{recovery_pct:.2f}% | ราคา Re-Buy {pending_rebuy_price:,.2f} | "
+                        f"confirm {self.boss_recovery_confirm_count}/{boss_confirm_cycles})",
                         "INFO")
             return ""
 
@@ -2190,13 +3778,14 @@ class TradingBotGUI:
         positions = self.strategy.get_open_positions(symbol)
         scale_in_checked = False
         for pos in list(positions):
-            pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100
-            pnl_thb = (current_price - pos.entry_price) * pos.amount
+            pnl = self.strategy.get_position_pnl(pos, current_price)
+            pnl_pct = pnl["profit_pct"]
+            pnl_thb = pnl["profit_thb"]
 
             if self.strategy.check_stop_loss(pos, current_price):
-                record = self._do_sell(pos, current_price, "STOP_LOSS_TO_THB")
+                record = self._do_sell(pos, current_price, "STOP_LOSS_TO_THB", arm_auto_reentry=False)
                 if record:
-                    self._arm_boss_recovery_state(current_price, record["amount"] * current_price)
+                    self._arm_boss_recovery_state(current_price, float(record.get("net_exit_value_thb", 0.0) or 0.0))
                     self.root.after(0, self._log,
                         f"🔴 BOSS BACKUP STOP LOSS @ {current_price:,.2f} | "
                         f"ขายกลับเป็น THB | ขาดทุน: {pnl_thb:,.2f} THB ({pnl_pct:+.2f}%) | "
@@ -2218,6 +3807,32 @@ class TradingBotGUI:
                 recovery_pct = adaptive_profile["recovery_pct"]
                 rebuy_allocation_pct = adaptive_profile["rebuy_allocation_pct"]
                 hard_limit = adaptive_profile["hard_limit_pct"]
+                llm_advice = self._request_boss_llm_advice(
+                    "cutloss",
+                    symbol,
+                    current_price,
+                    balance,
+                    signals,
+                    ai_prediction,
+                    adaptive_profile,
+                    position=pos,
+                    pnl_pct=pnl_pct,
+                    pnl_thb=pnl_thb,
+                )
+                cutloss_pct = max(
+                    self.config.trading.adaptive_cutloss_floor_pct,
+                    min(
+                        self.config.trading.adaptive_cutloss_ceiling_pct,
+                        self._blend_numeric_advice(cutloss_pct, llm_advice.get("cutloss_pct")),
+                    ),
+                )
+                recovery_pct = max(
+                    self.config.trading.adaptive_rebuy_floor_pct,
+                    min(
+                        self.config.trading.adaptive_rebuy_ceiling_pct,
+                        self._blend_numeric_advice(recovery_pct, llm_advice.get("recovery_pct")),
+                    ),
+                )
                 if not scale_in_checked and abs(pnl_pct) < hard_limit:
                     scale_in_checked = True
                     scale_in_action = self._check_ai_scale_in(
@@ -2234,15 +3849,21 @@ class TradingBotGUI:
                     min_loss_pct=cutloss_pct,
                     hard_limit_pct=hard_limit,
                 )
+                llm_force_sell = self._llm_is_confident(llm_advice, "SELL") and pnl_pct <= -cutloss_pct
+                llm_hold = self._llm_is_confident(llm_advice, "HOLD")
+                if llm_hold and abs(pnl_pct) < hard_limit:
+                    ai_cutloss = {**ai_cutloss, "should_sell": False}
+                elif llm_force_sell:
+                    ai_cutloss = {**ai_cutloss, "should_sell": True, "reason": f"LLM_SELL: {llm_advice.get('reason', '')}"}
                 if ai_cutloss["should_sell"]:
-                    record = self._do_sell(pos, current_price, ai_cutloss["reason"])
+                    record = self._do_sell(pos, current_price, ai_cutloss["reason"], arm_auto_reentry=False)
                     if record:
-                        self._arm_boss_recovery_state(current_price, record["amount"] * current_price)
+                        self._arm_boss_recovery_state(current_price, float(record.get("net_exit_value_thb", 0.0) or 0.0))
                         self.root.after(0, self._log,
                             f"🏆 AI BOSS CUTLOSS @ {current_price:,.2f} | "
                             f"ขายกลับเป็น THB | ขาดทุน: {pnl_thb:,.2f} THB ({pnl_pct:+.2f}%) | "
                             f"AI CutLoss {cutloss_pct:.2f}% | Hard Limit {hard_limit:.2f}% | "
-                            f"รอราคาฟื้น +{recovery_pct:.2f}% จากจุดขายเพื่อซื้อคืน {rebuy_allocation_pct:.0f}% ของงบเดิม",
+                            f"รอราคาฟื้น +{recovery_pct:.2f}% จากจุดขายเพื่อซื้อคืน {rebuy_allocation_pct:.0f}% ของงบเดิม | ราคา Re-Buy {self._get_rebuy_target_price(current_price, recovery_pct, trigger_buffer_pct):,.2f}",
                             "TRADE")
                         return "AI_BOSS_CUTLOSS"
                 elif self.cycle_count % 3 == 0:
@@ -2262,8 +3883,31 @@ class TradingBotGUI:
                 ai_prediction,
                 rl_decision,
             )
+            take_profit_snapshot = self.strategy.get_position_pnl(pos, current_price)
+            take_profit_pnl = take_profit_snapshot["profit_pct"]
+            take_profit_thb = take_profit_snapshot["profit_thb"]
+            llm_tp_advice = self._request_boss_llm_advice(
+                "take_profit",
+                symbol,
+                current_price,
+                balance,
+                signals,
+                ai_prediction,
+                adaptive_profile,
+                position=pos,
+                pnl_pct=take_profit_pnl,
+                pnl_thb=take_profit_thb,
+            )
+            if self._llm_is_confident(llm_tp_advice, "HOLD"):
+                ai_take_profit = {**ai_take_profit, "should_sell": False}
+            elif self._llm_is_confident(llm_tp_advice, "SELL") and take_profit_pnl >= self.config.trading.quick_profit_sell_pct:
+                ai_take_profit = {
+                    **ai_take_profit,
+                    "should_sell": True,
+                    "reason": f"LLM_TAKE_PROFIT: {llm_tp_advice.get('reason', '')}",
+                }
             if ai_take_profit["should_sell"]:
-                record = self._do_sell(pos, current_price, ai_take_profit["reason"])
+                record = self._do_sell(pos, current_price, ai_take_profit["reason"], arm_auto_reentry=False)
                 if record:
                     self.root.after(0, self._log,
                         f"🤖 AI TAKE PROFIT @ {current_price:,.2f} | "
@@ -2272,9 +3916,10 @@ class TradingBotGUI:
                     return "AI_TAKE_PROFIT"
 
             if self.strategy.check_take_profit(pos, current_price):
-                pnl_thb = (current_price - pos.entry_price) * pos.amount
-                pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100
-                record = self._do_sell(pos, current_price, "TAKE_PROFIT_TO_THB")
+                pnl = self.strategy.get_position_pnl(pos, current_price)
+                pnl_thb = pnl["profit_thb"]
+                pnl_pct = pnl["profit_pct"]
+                record = self._do_sell(pos, current_price, "TAKE_PROFIT_TO_THB", arm_auto_reentry=False)
                 if record:
                     self.root.after(0, self._log,
                         f"🟢 TAKE PROFIT @ {current_price:,.2f} | "
@@ -2289,8 +3934,9 @@ class TradingBotGUI:
         """Check AI cut loss / stop loss / take profit for open positions."""
         scale_in_checked = False
         for pos in list(self.strategy.get_open_positions(symbol)):
-            pnl_thb = (current_price - pos.entry_price) * pos.amount
-            pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100
+            pnl = self.strategy.get_position_pnl(pos, current_price)
+            pnl_thb = pnl["profit_thb"]
+            pnl_pct = pnl["profit_pct"]
             rl_decision = self._build_rl_live_decision(df_ind, pos)
             adaptive_profile = self.strategy.get_adaptive_risk_profile(
                 signals,
@@ -2335,29 +3981,32 @@ class TradingBotGUI:
             if ai_cutloss["should_sell"]:
                 record = self._do_sell(pos, current_price, ai_cutloss["reason"])
                 if record:
+                    trigger_buffer_pct = max(getattr(self.config.trading, "reentry_trigger_buffer_pct", 0.05), 0.0)
                     self.root.after(0, self._log,
                                     f"🤖 AI CUTLOSS @ {current_price:,.2f} | "
                                     f"ขายกลับเป็น THB | ขาดทุน: {pnl_thb:,.2f} THB ({pnl_pct:+.2f}%) | "
-                                    f"AI CutLoss {adaptive_profile['cutloss_pct']:.2f}% / Hard {adaptive_profile['hard_limit_pct']:.2f}%",
+                                    f"AI CutLoss {adaptive_profile['cutloss_pct']:.2f}% / Hard {adaptive_profile['hard_limit_pct']:.2f}% | ราคา Re-Buy {self._get_rebuy_target_price(current_price, adaptive_profile['recovery_pct'], trigger_buffer_pct):,.2f}",
                                     "TRADE")
                     return "AI_CUTLOSS"
 
             if self.strategy.check_stop_loss(pos, current_price):
                 record = self._do_sell(pos, current_price, "STOP_LOSS_TO_THB")
                 if record:
+                    trigger_buffer_pct = max(getattr(self.config.trading, "reentry_trigger_buffer_pct", 0.05), 0.0)
                     self.root.after(0, self._log,
                                     f"🔴 STOP LOSS @ {current_price:,.2f} | "
                                     f"ขายกลับเป็น THB | ขาดทุน: {pnl_thb:,.2f} THB ({pnl_pct:+.2f}%) | "
-                                    f"ตัดขาดทุนอัตโนมัติ!", "TRADE")
+                                    f"ตัดขาดทุนอัตโนมัติ! | ราคา Re-Buy {self._get_rebuy_target_price(current_price, adaptive_profile['recovery_pct'], trigger_buffer_pct):,.2f}", "TRADE")
                     return "STOP_LOSS"
 
             if self.strategy.check_take_profit(pos, current_price):
                 record = self._do_sell(pos, current_price, "TAKE_PROFIT_TO_THB")
                 if record:
+                    trigger_buffer_pct = max(getattr(self.config.trading, "reentry_trigger_buffer_pct", 0.05), 0.0)
                     self.root.after(0, self._log,
                                     f"🟢 TAKE PROFIT @ {current_price:,.2f} | "
                                     f"ขายกลับเป็น THB | กำไร: {pnl_thb:,.2f} THB ({pnl_pct:+.2f}%) | "
-                                    f"ทำกำไรอัตโนมัติ!", "TRADE")
+                                    f"ทำกำไรอัตโนมัติ! | ราคา Re-Buy {self._get_rebuy_target_price(current_price, adaptive_profile['recovery_pct'], trigger_buffer_pct):,.2f}", "TRADE")
                     return "TAKE_PROFIT"
         return ""
 
@@ -2374,6 +4023,7 @@ class TradingBotGUI:
         if not self.auto_reentry_enabled.get():
             return ""
         if positions:
+            self._clear_auto_reentry(symbol)
             return ""
         if not self.reentry_waiting or self.reentry_symbol != symbol:
             return ""
@@ -2395,6 +4045,9 @@ class TradingBotGUI:
         rise_pct = adaptive_profile["recovery_pct"]
         delay_pct = max(base_delay_pct, adaptive_profile["delay_pct"])
         rebuy_allocation_pct = adaptive_profile["rebuy_allocation_pct"]
+        reentry_cooldown_cycles = max(getattr(self.config.trading, "reentry_cooldown_cycles", 1), 0)
+        reentry_confirm_cycles = max(getattr(self.config.trading, "reentry_confirm_cycles", 2), 1)
+        trigger_buffer_pct = max(getattr(self.config.trading, "reentry_trigger_buffer_pct", 0.05), 0.0)
 
         tracker = self._update_recovery_tracker(
             self.reentry_last_exit_price,
@@ -2403,8 +4056,37 @@ class TradingBotGUI:
             rise_pct,
         )
         self.reentry_recovery_low_price = tracker["low_price"]
+        pending_rebuy_price = self._get_rebuy_target_price(
+            self.reentry_last_exit_price,
+            rise_pct,
+            trigger_buffer_pct,
+            self.reentry_recovery_low_price,
+        )
+        cycles_waited = max(self.cycle_count - self.reentry_sell_cycle, 0)
 
-        if tracker["recovery_from_low_pct"] >= rise_pct:
+        if cycles_waited < reentry_cooldown_cycles:
+            self.reentry_confirm_count = 0
+            if self.cycle_count % 3 == 0:
+                self.root.after(
+                    0,
+                    self._log,
+                    f"🔁 Re-Buy cooldown หลังขาย {symbol} | รออีก {reentry_cooldown_cycles - cycles_waited} รอบ | "
+                    f"low หลังขาย {self.reentry_recovery_low_price:,.2f} | ราคา Re-Buy {pending_rebuy_price:,.2f}",
+                    "INFO",
+                )
+            return "REENTRY_WAIT"
+
+        confirmation = self._update_recovery_confirmation(
+            current_price,
+            tracker["trigger_price"],
+            self.reentry_confirm_count,
+            reentry_confirm_cycles,
+            trigger_buffer_pct,
+            tracker["low_updated"],
+        )
+        self.reentry_confirm_count = confirmation["confirm_count"]
+
+        if tracker["recovery_from_low_pct"] >= rise_pct and confirmation["confirmed"]:
             buy_amount = min(
                 balance * min(rebuy_allocation_pct / 100, 0.95),
                 self.reentry_budget_thb * (rebuy_allocation_pct / 100),
@@ -2442,7 +4124,7 @@ class TradingBotGUI:
                     f"ต่ำกว่าจุดขาย {self.reentry_last_exit_price:,.2f} | "
                     f"low หลังขาย {self.reentry_recovery_low_price:,.2f} | "
                     f"ฟื้นจาก low {tracker['recovery_from_low_pct']:+.2f}% "
-                    f"(เกณฑ์ชะลอ {delay_pct:.2f}% | trigger {tracker['trigger_price']:,.2f})",
+                    f"(เกณฑ์ชะลอ {delay_pct:.2f}% | ราคา Re-Buy {pending_rebuy_price:,.2f})",
                     "WARN",
                 )
             return "DELAY_BUY"
@@ -2454,7 +4136,8 @@ class TradingBotGUI:
                 f"🔁 รอจังหวะ Re-Buy {symbol} | ขายเดิม {self.reentry_last_exit_price:,.2f} | "
                 f"low หลังขาย {self.reentry_recovery_low_price:,.2f} | "
                 f"ฟื้นจาก low {tracker['recovery_from_low_pct']:+.2f}% "
-                f"(ต้องการ {rise_pct:.2f}% | trigger {tracker['trigger_price']:,.2f})",
+                f"(ต้องการ {rise_pct:.2f}% | ราคา Re-Buy {pending_rebuy_price:,.2f} | "
+                f"confirm {self.reentry_confirm_count}/{reentry_confirm_cycles})",
                 "INFO",
             )
 
@@ -2470,6 +4153,8 @@ class TradingBotGUI:
         self.reentry_last_exit_price = exit_price
         self.reentry_recovery_low_price = exit_price
         self.reentry_budget_thb = max(exit_value_thb, 0.0)
+        self.reentry_sell_cycle = self.cycle_count
+        self.reentry_confirm_count = 0
         self.reentry_last_reason = reason
 
     def _clear_auto_reentry(self, symbol: str = ""):
@@ -2481,6 +4166,8 @@ class TradingBotGUI:
         self.reentry_last_exit_price = 0.0
         self.reentry_recovery_low_price = 0.0
         self.reentry_budget_thb = 0.0
+        self.reentry_sell_cycle = 0
+        self.reentry_confirm_count = 0
         self.reentry_last_reason = ""
 
     def _check_signals(self, symbol, signals, ai_pred, balance, price) -> str:
@@ -2493,12 +4180,39 @@ class TradingBotGUI:
             last_reasons = ""
             for pos in list(positions):
                 sell = self.strategy.should_sell(signals, ai_pred, pos)
-                if not sell["should_sell"]:
+                sell_snapshot = self.strategy.get_position_pnl(pos, price)
+                for_sell_pnl_pct = sell_snapshot["profit_pct"]
+                for_sell_pnl_thb = sell_snapshot["profit_thb"]
+                sell_advice = self._request_trade_llm_advice(
+                    "exit",
+                    symbol,
+                    price,
+                    balance,
+                    signals,
+                    ai_pred,
+                    position=pos,
+                    reasons=sell.get("reasons", []),
+                    signal_score=sell.get("score", 0.0),
+                )
+                sell_gate = self._apply_trade_llm_gate(sell_advice, allow_action="SELL", block_action="HOLD")
+                should_sell = sell["should_sell"]
+                if sell_gate["block"]:
+                    should_sell = False
+                    if self.cycle_count % 3 == 0:
+                        self.root.after(
+                            0,
+                            self._log,
+                            f"🧠 LLM ชะลอ SELL {symbol} | {sell_gate['reason']}",
+                            "AI",
+                        )
+                elif sell_gate["allow"]:
+                    should_sell = True
+                    sell["reasons"] = list(sell.get("reasons", [])) + [f"LLM: {sell_gate['reason']}"]
+
+                if not should_sell:
                     continue
                 sold_any = True
                 last_reasons = "; ".join(sell["reasons"])
-                for_sell_pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
-                for_sell_pnl_thb = (price - pos.entry_price) * pos.amount
                 self._do_sell(pos, price, "SELL_SIGNAL")
                 self.root.after(0, self._log,
                     f"📉 SELL signal | P/L: {for_sell_pnl_thb:+,.2f} THB ({for_sell_pnl_pct:+.2f}%)",
@@ -2507,11 +4221,56 @@ class TradingBotGUI:
                 self.root.after(0, self._log, f"  เหตุผล: {last_reasons}", "TRADE")
                 return "SELL"
 
+        return self._check_buy_signal_once(
+            symbol,
+            signals,
+            ai_pred,
+            balance,
+            price,
+            positions=positions,
+        )
+
+    def _check_buy_signal_once(self, symbol, signals, ai_pred, balance, price,
+                               positions=None, configured_amount_override: Optional[float] = None,
+                               force_feedback: bool = False) -> str:
+        """Evaluate the buy side of auto trade exactly once."""
+        positions = positions if positions is not None else self.strategy.get_open_positions(symbol)
+        should_log_detail = force_feedback or self.cycle_count % 3 == 0
+
         # BUY signals
         buy = self.strategy.should_buy(signals, ai_pred)
-        if buy["should_buy"]:
+        buy_advice = self._request_trade_llm_advice(
+            "entry",
+            symbol,
+            price,
+            balance,
+            signals,
+            ai_pred,
+            reasons=buy.get("reasons", []),
+            signal_score=buy.get("score", 0.0),
+        )
+        buy_gate = self._apply_trade_llm_gate(buy_advice, allow_action="BUY", block_action="SKIP")
+        should_buy = buy["should_buy"]
+        if buy_gate["block"]:
+            should_buy = False
+            if should_log_detail:
+                self.root.after(
+                    0,
+                    self._log,
+                    f"🧠 LLM ข้าม BUY {symbol} | {buy_gate['reason']}",
+                    "AI",
+                )
+        elif buy_gate["allow"]:
+            should_buy = True
+            buy["reasons"] = list(buy.get("reasons", [])) + [f"LLM: {buy_gate['reason']}"]
+
+        reason_summary = self._format_reason_list(buy.get("reasons", []), max_items=3, max_length=170)
+        wait_hint = self._build_buy_wait_hint(price, signals, buy)
+
+        if should_buy:
             # Allow buy if no position OR if adding to profitable position
             can_buy = not positions
+            avg_pnl = 0.0
             if positions:
                 # Allow additional buy if existing position is in profit
                 avg_pnl = sum(
@@ -2521,12 +4280,14 @@ class TradingBotGUI:
                 if avg_pnl > 1.0:  # position is >1% in profit
                     can_buy = True
 
-            if can_buy:
+            configured_amount = configured_amount_override
+            if configured_amount is None:
                 try:
                     configured_amount = float(self.auto_trade_amount_var.get())
                 except ValueError:
                     configured_amount = 0.0
 
+            if can_buy:
                 if configured_amount < 10:
                     self.root.after(
                         0,
@@ -2545,20 +4306,72 @@ class TradingBotGUI:
                     )
                     return "INSUFFICIENT_AUTO_BUY"
 
-                self._do_buy(symbol, configured_amount, price)
+                sizing = self.risk_manager.calculate_position_size(
+                    balance,
+                    price,
+                    buy.get("signal_strength", 0.0),
+                    signals,
+                    ai_pred,
+                )
+                buy_amount = min(configured_amount, sizing["position_size_thb"], balance * 0.95)
+                if buy_amount < 10:
+                    if should_log_detail:
+                        note_text = self._format_reason_list(sizing.get("risk_notes", []), max_items=2, max_length=120)
+                        self.root.after(
+                            0,
+                            self._log,
+                            f"⚠️ สัญญาณ BUY มาแล้ว แต่ระบบลดขนาดไม้ตามความเสี่ยงจนต่ำกว่า 10 THB | {note_text or sizing.get('market_regime', 'Risk guard')}",
+                            "WARN",
+                        )
+                    return "RISK_CAPPED_BUY"
+
+                if buy_amount < configured_amount and should_log_detail:
+                    note_text = self._format_reason_list(sizing.get("risk_notes", []), max_items=2, max_length=120)
+                    self.root.after(
+                        0,
+                        self._log,
+                        f"🛡️ Auto Buy ถูก cap จาก ฿{configured_amount:,.0f} เหลือ ฿{buy_amount:,.0f} | {note_text or sizing.get('market_regime', 'Risk guard')}",
+                        "INFO",
+                    )
+
+                self._do_buy(symbol, buy_amount, price)
                 reasons = "; ".join(buy["reasons"])
                 self.root.after(
                     0,
                     self._log,
-                    f"📈 AI BUY ฿{configured_amount:,.0f} | {reasons}",
+                    f"📈 AI BUY ฿{buy_amount:,.0f} | {reasons}",
                     "TRADE",
                 )
                 return "BUY"
+
+            if should_log_detail:
+                detail = (
+                    f"⏳ ยังไม่ซื้อเพิ่ม {symbol} | มี position อยู่แล้ว | กำไรเฉลี่ย {avg_pnl:+.2f}% "
+                    f"ยังไม่ถึง +1.00%"
+                )
+                if reason_summary:
+                    detail = f"{detail} | {reason_summary}"
+                self.root.after(0, self._log, detail, "INFO")
+                if wait_hint:
+                    self.root.after(0, self._log, f"  รอจังหวะเข้าเพิ่ม: {wait_hint}", "INFO")
+            return ""
+
+        if should_log_detail:
+            score_text = f"score {float(buy.get('score', 0.0) or 0.0):.2f}/{self.config.trading.min_buy_signal_score:.2f}"
+            detail = f"⏳ ยังไม่ซื้อ {symbol} | {score_text}"
+            if wait_hint:
+                detail = f"{detail} | {wait_hint}"
+            self.root.after(0, self._log, detail, "INFO")
+            if reason_summary:
+                self.root.after(0, self._log, f"  เหตุผล: {reason_summary}", "INFO")
 
         return ""
 
     def _do_buy(self, symbol: str, amount_thb: float, price: float):
         """Execute buy order."""
+        if self._is_paper_trade_mode():
+            self._execute_paper_buy(symbol, amount_thb, price)
+            return
         if not self.client:
             return
         order = self.client.create_buy_order(symbol, amount_thb)
@@ -2567,21 +4380,34 @@ class TradingBotGUI:
                 f"❌ Auto-buy failed: error {order['_error']} | {order.get('_raw', '')}", "ERROR")
             return
         if order:
-            buy_fee_rate = max(float(getattr(self.config.trading, "buy_fee_rate", 0.0027) or 0.0), 0.0)
-            crypto_amount = order.get("amount", (amount_thb * (1 - buy_fee_rate)) / price if price else 0)
+            crypto_amount = order.get("amount", amount_thb / price if price else 0)
             exec_price = order.get("rate", price)
             if exec_price <= 0:
                 exec_price = price
             if crypto_amount <= 0:
-                crypto_amount = (amount_thb * (1 - buy_fee_rate)) / exec_price if exec_price else 0
-            self.strategy.add_position(symbol, exec_price, crypto_amount)
+                crypto_amount = amount_thb / exec_price if exec_price else 0
+            self.strategy.add_position(
+                symbol,
+                exec_price,
+                crypto_amount,
+                cost_thb=float(order.get("cost", amount_thb) or amount_thb),
+            )
+            self._clear_boss_recovery_state()
             self._clear_auto_reentry(symbol)
             self.root.after(0, self._add_history_entry,
                             "BUY", exec_price, 0)
             self.root.after(0, self._update_pnl_display, exec_price)
 
-    def _do_sell(self, position: Position, price: float, reason: str):
+    def _do_sell(self, position: Position, price: float, reason: str,
+                 arm_auto_reentry: bool = True):
         """Execute sell order back into THB."""
+        if self._is_paper_trade_mode():
+            return self._execute_paper_sell(
+                position,
+                price,
+                reason,
+                arm_auto_reentry=arm_auto_reentry,
+            )
         if not self.client:
             return
 
@@ -2612,14 +4438,19 @@ class TradingBotGUI:
             if exit_price <= 0:
                 exit_price = price
 
-        record = self.strategy.close_position(position, exit_price, reason)
+        record = self.strategy.close_position(
+            position,
+            exit_price,
+            reason,
+            net_exit_value_thb=float(order.get("received", 0.0) or 0.0),
+        )
         if record:
             self.risk_manager.record_trade_result(record["profit_thb"])
-            if self.bot_running and reason != "MANUAL_SELL":
+            if self.bot_running and arm_auto_reentry and reason != "MANUAL_SELL":
                 self._arm_auto_reentry(
                     position.symbol,
                     exit_price,
-                    exit_price * position.amount,
+                    float(record.get("net_exit_value_thb", 0.0) or 0.0),
                     reason,
                 )
             # Track bot performance
@@ -2658,7 +4489,7 @@ class TradingBotGUI:
         # Total P/L = realized + unrealized
         unrealized = 0.0
         for pos in self.strategy.positions:
-            unrealized += (current_price - pos.entry_price) * pos.amount
+            unrealized += self.strategy.get_position_pnl(pos, current_price)["profit_thb"]
         total_pnl = realized + unrealized
         self.bot_total_pnl_str.set(f"{total_pnl:+,.2f} THB")
         clr_t = COLORS["green"] if total_pnl >= 0 else COLORS["red"]
@@ -2676,32 +4507,15 @@ class TradingBotGUI:
 
         # Trade stats
         self.bot_trade_stats_label.config(
-            text=f"Trades: {self.bot_total_trades}  |  "
-                 f"✅ Win: {self.bot_win_trades}  |  "
-                 f"❌ Lose: {self.bot_lose_trades}"
+              text=f"เทรด: {self.bot_total_trades}  |  "
+                  f"✅ ชนะ: {self.bot_win_trades}  |  "
+                  f"❌ แพ้: {self.bot_lose_trades}"
         )
 
         # Boss mode status
-        if self.boss_mode.get():
-            if self.boss_waiting_recovery:
-                txt = (
-                    f"🏆 Boss: รอซื้อคืน | ขาย {self.boss_last_sell_price:,.2f} | "
-                    f"low {self.boss_recovery_low_price:,.2f}"
-                )
-            else:
-                txt = "🏆 Boss: กำลังถือเหรียญ"
-            self.bot_boss_status_label.config(text=txt, fg=COLORS["yellow"])
-        else:
-            self.bot_boss_status_label.config(text="Boss: OFF", fg=COLORS["text_dim"])
-
-        if self.reentry_waiting and self.reentry_symbol:
-            self.bot_boss_status_label.config(
-                text=(
-                    f"🔁 Re-Buy รอ {self.reentry_symbol} | ขาย {self.reentry_last_exit_price:,.2f} | "
-                    f"low {self.reentry_recovery_low_price:,.2f}"
-                ),
-                fg=COLORS["accent"],
-            )
+        snapshot = self._get_boss_runtime_snapshot(current_price)
+        self.boss_realtime_status.set(snapshot["title"])
+        self.boss_realtime_detail.set(snapshot["detail"])
 
     def _update_market_data(self):
         """Fetch and display current market data."""
@@ -2752,11 +4566,16 @@ class TradingBotGUI:
         )
 
         thb_info = self.wallet_balances.get("THB", {})
-        balance = thb_info.get("available", 0)
+        live_balance = thb_info.get("available", 0)
+        balance = self._get_runtime_trade_balance(live_balance)
         self.balance_thb.set(f"{balance:,.2f} THB")
+        self._update_balance_display(balance, price)
 
     def _update_gui_data(self, signals: Dict, ai_prediction: Dict):
         """Update GUI with latest signals and AI data."""
+        self.last_signals = dict(signals)
+        self.last_ai_prediction = dict(ai_prediction)
+
         # Price
         price = signals.get("price", 0)
         self.current_price.set(f"{price:,.2f}")
@@ -2793,12 +4612,13 @@ class TradingBotGUI:
             self.positions_tree.delete(item)
 
         for pos in self.strategy.positions:
-            pnl = (current_price - pos.entry_price) / pos.entry_price * 100
+            pnl = self.strategy.get_position_pnl(pos, current_price)
             self.positions_tree.insert("", "end", values=(
                 pos.symbol,
-                f"{pos.entry_price:,.2f}",
+                f"{(pnl['entry_cost_thb'] / pos.amount) if pos.amount > 0 else pos.entry_price:,.2f}",
                 f"{current_price:,.2f}",
-                f"{pnl:+.2f}%",
+                f"{pnl['profit_pct']:+.2f}%",
+                f"{pnl['profit_thb']:+,.2f}",
                 f"{pos.amount:.8f}",
                 f"{pos.stop_loss_price:,.2f}",
                 f"{pos.take_profit_price:,.2f}",
@@ -2808,17 +4628,22 @@ class TradingBotGUI:
         """Update balance display."""
         total = balance
         for pos in self.strategy.positions:
-            total += pos.amount * current_price
+            mark_price = current_price if current_price > 0 else pos.entry_price
+            total += self.strategy.estimate_exit_value_thb(pos.amount, mark_price)
 
         self.balance_thb.set(f"{balance:,.2f} THB")
         self.total_value.set(f"{total:,.2f} THB")
 
-        pnl = total - balance
+        pnl = total - self.initial_portfolio_value if self.initial_portfolio_value > 0 else total - balance
         self.pnl_text.set(f"{pnl:+,.2f} THB")
 
     def _update_risk_display(self, balance: float):
         """Update risk status."""
         risk = self.risk_manager.get_risk_status(balance, self.strategy.positions)
+        market_profile = self.risk_manager.get_market_risk_profile(
+            self.last_signals,
+            self.last_ai_prediction,
+        )
         self.risk_text.config(
             text=(
                 f"Daily Loss: {risk['daily_loss']:,.0f} / "
@@ -2827,6 +4652,22 @@ class TradingBotGUI:
                 f"Exposure: {risk['exposure_pct']:.1f}%"
             )
         )
+        self.risk_regime_text.set(
+            f"Market: {market_profile['regime_label']} | Scale {market_profile['position_scale_pct']:.0f}% | ATR {market_profile['atr_pct']:.2f}%"
+        )
+        guard_notes = market_profile.get("reasons", [])
+        guard_text = " | ".join(guard_notes[:3]) if guard_notes else "ไม่มีตัวกรองความเสี่ยงพิเศษในรอบนี้"
+        guard_text = f"Loss streak: {risk['loss_streak']} | Daily trades: {risk['daily_trades']} | {guard_text}"
+        self.risk_guard_text.set(self._truncate_ui_text(guard_text, 180))
+
+        regime_color = COLORS["green"]
+        if market_profile["regime"] == "downtrend":
+            regime_color = COLORS["yellow"]
+        elif market_profile["regime"] == "volatile_downtrend":
+            regime_color = COLORS["red"]
+        elif market_profile["regime"] == "high_volatility":
+            regime_color = COLORS["accent"]
+        self.risk_regime_label.config(fg=regime_color)
 
     def _update_pnl_display(self, current_price: float):
         """Update real-time P/L display for all open positions."""
@@ -2844,14 +4685,15 @@ class TradingBotGUI:
         summaries = []
 
         for pos in positions:
-            pnl_thb = (current_price - pos.entry_price) * pos.amount
-            pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100
-            cost = pos.entry_price * pos.amount
+            pnl = self.strategy.get_position_pnl(pos, current_price)
+            pnl_thb = pnl["profit_thb"]
+            pnl_pct = pnl["profit_pct"]
+            effective_entry = (pnl["entry_cost_thb"] / pos.amount) if pos.amount > 0 else pos.entry_price
             total_pnl_thb += pnl_thb
-            total_cost += cost
+            total_cost += pnl["entry_cost_thb"]
             coin = pos.symbol.split("_")[0]
             summaries.append(
-                f"{coin}: {pos.amount:.6g} @ {pos.entry_price:,.2f} → "
+                f"{coin}: {pos.amount:.6g} @ {effective_entry:,.2f} → "
                 f"{current_price:,.2f} ({pnl_pct:+.2f}%)"
             )
 
@@ -2896,7 +4738,7 @@ class TradingBotGUI:
             if df is not None and not df.empty:
                 df_ind = self.indicator_engine.add_all_indicators(df)
                 signals = self.indicator_engine.get_signal_summary(df_ind)
-                ai_pred = self.lstm_predictor.predict(df_ind)
+                ai_pred = self._predict_ai(df_ind)
                 self.root.after(0, self._update_gui_data, signals, ai_pred)
 
             self.root.after(0, self._update_market_data)
@@ -2910,12 +4752,18 @@ class TradingBotGUI:
             messagebox.showinfo("Info", "กรุณาเชื่อมต่อ Exchange ก่อน")
             return
 
+        if self._ai_training_in_progress:
+            self._log("AI training is already running", "WARN")
+            return
+
+        self._ai_training_in_progress = True
         self._log("Starting AI training...", "AI")
         threading.Thread(target=self._do_train, daemon=True).start()
 
     def _do_train(self):
         """Perform AI training in background."""
         if not self.data_collector:
+            self._ai_training_in_progress = False
             return
         try:
             symbol = self.config.trading.symbol
@@ -2932,20 +4780,40 @@ class TradingBotGUI:
             self.root.after(0, self._log,
                             f"Training data: {len(df_ind)} bars", "AI")
 
+            trained_lstm = LSTMPredictor(self.config.ai, self.logger)
+            trained_rl = RLTradingAgent(self.config.ai, logger=self.logger)
+
             # Train LSTM
             self.root.after(0, self._log, "Training LSTM model...", "AI")
-            self.lstm_predictor.train(df_ind)
+            trained_lstm.train(df_ind)
             self.root.after(0, self._log, "LSTM training complete ✅", "SUCCESS")
 
             # Train RL
             self.root.after(0, self._log, "Training RL agent...", "AI")
-            self.rl_agent.train(df_ind, episodes=200)
+            trained_rl.train(df_ind, episodes=200)
             self.root.after(0, self._log, "RL training complete ✅", "SUCCESS")
 
-            self.root.after(0, self._log, "All AI models trained and saved! 🎉", "SUCCESS")
+            reload_state = self._reload_saved_ai_models(df_ind)
+            if reload_state["lstm"] != "saved":
+                self._commit_ai_models(lstm_predictor=trained_lstm)
+            if reload_state["rl"] != "saved":
+                self._commit_ai_models(rl_agent=trained_rl)
+
+            signals = self.indicator_engine.get_signal_summary(df_ind)
+            ai_pred = self._predict_ai(df_ind)
+            self.root.after(0, self._update_gui_data, signals, ai_pred)
+
+            self.root.after(
+                0,
+                self._log,
+                "All AI models trained, saved, and applied to auto trade permanently ✅",
+                "SUCCESS",
+            )
 
         except Exception as e:
             self.root.after(0, self._log, f"Training error: {e}", "ERROR")
+        finally:
+            self._ai_training_in_progress = False
 
     def _run_backtest(self):
         """Run backtest in background."""
