@@ -52,6 +52,7 @@ class TradingBotGUI:
         self.root.geometry("1280x850")
         self.root.minsize(1100, 750)
         self.root.configure(bg=COLORS["bg"])
+        self.root.protocol("WM_DELETE_WINDOW", self._on_window_close_request)
 
         # State
         self.config = AppConfig.from_env()
@@ -147,8 +148,11 @@ class TradingBotGUI:
         self.bot_uptime_str = tk.StringVar(value="00:00:00")
         self.bot_cycles_str = tk.StringVar(value="0")
         self.bot_realized_pnl_str = tk.StringVar(value="0.00 THB")
+        self.bot_unrealized_pnl_str = tk.StringVar(value="0.00 THB")
         self.bot_total_pnl_str = tk.StringVar(value="0.00 THB")
         self.bot_winrate_str = tk.StringVar(value="— %")
+        self.bot_last_loss_source_str = tk.StringVar(value="ขาดทุนที่ปิดล่าสุด: ยังไม่มี")
+        self.bot_unrealized_source_str = tk.StringVar(value="ลอยตัวตอนนี้: ยังไม่มี position")
         self.auto_trade_amount_var = tk.StringVar(value="100")
         self.quick_buy_mode_var = tk.StringVar(value="manual_auto")
         self.quick_buy_mode_hint = tk.StringVar(value="Manual Buy + Auto Trade: ซื้อทันทีแล้วให้บอทดูแล position ต่อ")
@@ -156,6 +160,10 @@ class TradingBotGUI:
         self.ai_scale_in_loss_pct_var = tk.StringVar(value=f"{self.config.trading.ai_scale_in_loss_pct:.2f}")
         self.ai_take_profit_enabled = tk.BooleanVar(value=True)
         self.ai_take_profit_pct_var = tk.StringVar(value=f"{self.config.trading.ai_take_profit_min_profit_pct:.2f}")
+        self.profit_cashout_enabled = tk.BooleanVar(value=self.config.trading.profit_cashout_enabled)
+        self.profit_cashout_pct_var = tk.StringVar(value=f"{self.config.trading.profit_cashout_min_profit_pct:.2f}")
+        self.fee_guard_enabled = tk.BooleanVar(value=self.config.trading.small_position_fee_guard_enabled)
+        self.fee_guard_max_cost_var = tk.StringVar(value=f"{self.config.trading.small_position_fee_guard_max_cost_thb:.0f}")
         self._runtime_settings_snapshot: Dict[str, object] = {}
         self._runtime_settings_invalid = False
         self._runtime_badges: Dict[str, tk.Label] = {}
@@ -175,6 +183,7 @@ class TradingBotGUI:
         self._runtime_apply_after_id = None
         self._scroll_columns: Dict[str, tk.Canvas] = {}
         self._collapsible_cards: Dict[str, Dict[str, object]] = {}
+        self._fee_guard_history_state: Dict[str, bool] = {}
 
         self._build_ui()
         self._setup_runtime_badges()
@@ -570,6 +579,7 @@ class TradingBotGUI:
 
         perf_items = [
             ("💰 กำไร/ขาดทุนที่ปิดแล้ว", self.bot_realized_pnl_str, "realized_pnl"),
+            ("📈 กำไร/ขาดทุนลอยตัว", self.bot_unrealized_pnl_str, "unrealized_pnl"),
             ("📊 กำไร/ขาดทุนรวม", self.bot_total_pnl_str, "total_pnl"),
             ("🏆 อัตราชนะ", self.bot_winrate_str, "winrate"),
         ]
@@ -600,21 +610,36 @@ class TradingBotGUI:
         self.bot_trade_stats_label.pack(side=tk.LEFT)
 
         row4 = tk.Frame(card, bg=COLORS["bg_input"])
-        row4.pack(fill=tk.X, padx=10, pady=(0, 8))
+        row4.pack(fill=tk.X, padx=10, pady=(0, 6))
 
         tk.Label(
-            row4, text="เหตุผลการตัดสินใจ", font=("Segoe UI", 8),
+            row4, textvariable=self.bot_last_loss_source_str, font=("Segoe UI", 8),
+            fg=COLORS["red"], bg=COLORS["bg_input"], anchor="w", justify=tk.LEFT,
+            wraplength=760
+        ).pack(fill=tk.X, padx=10, pady=(6, 2))
+
+        tk.Label(
+            row4, textvariable=self.bot_unrealized_source_str, font=("Segoe UI", 8),
+            fg=COLORS["text_dim"], bg=COLORS["bg_input"], anchor="w", justify=tk.LEFT,
+            wraplength=760
+        ).pack(fill=tk.X, padx=10, pady=(0, 6))
+
+        row5 = tk.Frame(card, bg=COLORS["bg_input"])
+        row5.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        tk.Label(
+            row5, text="สรุปเหตุผลซื้อ/รอ/ถือ", font=("Segoe UI", 8),
             fg=COLORS["text_dim"], bg=COLORS["bg_input"], anchor="w"
         ).pack(fill=tk.X, padx=10, pady=(6, 0))
 
         self.bot_decision_status_label = tk.Label(
-            row4, textvariable=self.bot_decision_status, font=("Segoe UI", 9, "bold"),
+            row5, textvariable=self.bot_decision_status, font=("Segoe UI", 9, "bold"),
             fg=COLORS["text_bright"], bg=COLORS["bg_input"], anchor="w", justify=tk.LEFT
         )
         self.bot_decision_status_label.pack(fill=tk.X, padx=10, pady=(0, 2))
 
         self.bot_decision_detail_label = tk.Label(
-            row4, textvariable=self.bot_decision_detail, font=("Segoe UI", 8),
+            row5, textvariable=self.bot_decision_detail, font=("Segoe UI", 8),
             fg=COLORS["text_dim"], bg=COLORS["bg_input"], anchor="w", justify=tk.LEFT,
             wraplength=380
         )
@@ -974,27 +999,63 @@ class TradingBotGUI:
 
         ai_row3 = tk.Frame(ai_manage_frame, bg=COLORS["bg_card"])
         ai_row3.pack(fill=tk.X, pady=(2, 0))
+        self.profit_cashout_check = tk.Checkbutton(
+            ai_row3, text="💸 Profit Cashout", font=("Segoe UI", 9, "bold"),
+            variable=self.profit_cashout_enabled, fg=COLORS["yellow"],
+            bg=COLORS["bg_card"], selectcolor=COLORS["bg_input"],
+            activebackground=COLORS["bg_card"], activeforeground=COLORS["yellow"],
+            cursor="hand2"
+        )
+        self.profit_cashout_check.pack(side=tk.LEFT)
+        self._create_runtime_badge(ai_row3, "profit_cashout_enabled")
+        tk.Label(ai_row3, text="Profit %:", font=("Segoe UI", 8),
+                 fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side=tk.LEFT, padx=(12, 4))
+        self._create_runtime_badge(ai_row3, "profit_cashout_pct", padx=(0, 6))
+        tk.Entry(ai_row3, textvariable=self.profit_cashout_pct_var, font=("Segoe UI", 9),
+                 bg=COLORS["bg_input"], fg=COLORS["text"], width=6,
+                 relief=tk.FLAT, insertbackground=COLORS["text"]).pack(side=tk.LEFT, ipady=2)
+
+        ai_row4 = tk.Frame(ai_manage_frame, bg=COLORS["bg_card"])
+        ai_row4.pack(fill=tk.X, pady=(2, 0))
+        self.fee_guard_check = tk.Checkbutton(
+            ai_row4, text="🛡 Small Fee Guard", font=("Segoe UI", 9, "bold"),
+            variable=self.fee_guard_enabled, fg=COLORS["accent"],
+            bg=COLORS["bg_card"], selectcolor=COLORS["bg_input"],
+            activebackground=COLORS["bg_card"], activeforeground=COLORS["accent"],
+            cursor="hand2"
+        )
+        self.fee_guard_check.pack(side=tk.LEFT)
+        self._create_runtime_badge(ai_row4, "fee_guard_enabled")
+        tk.Label(ai_row4, text="Max THB:", font=("Segoe UI", 8),
+                 fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side=tk.LEFT, padx=(12, 4))
+        self._create_runtime_badge(ai_row4, "fee_guard_max_cost", padx=(0, 6))
+        tk.Entry(ai_row4, textvariable=self.fee_guard_max_cost_var, font=("Segoe UI", 9),
+                 bg=COLORS["bg_input"], fg=COLORS["text"], width=6,
+                 relief=tk.FLAT, insertbackground=COLORS["text"]).pack(side=tk.LEFT, ipady=2)
+
+        ai_row5 = tk.Frame(ai_manage_frame, bg=COLORS["bg_card"])
+        ai_row5.pack(fill=tk.X, pady=(2, 0))
         self.llm_trade_check = tk.Checkbutton(
-            ai_row3, text="🧠 LLM Trade Advisor", font=("Segoe UI", 9, "bold"),
+            ai_row5, text="🧠 LLM Trade Advisor", font=("Segoe UI", 9, "bold"),
             variable=self.llm_trade_enabled, fg=COLORS["yellow"],
             bg=COLORS["bg_card"], selectcolor=COLORS["bg_input"],
             activebackground=COLORS["bg_card"], activeforeground=COLORS["yellow"],
             cursor="hand2"
         )
         self.llm_trade_check.pack(side=tk.LEFT)
-        self._create_runtime_badge(ai_row3, "llm_trade_enabled")
+        self._create_runtime_badge(ai_row5, "llm_trade_enabled")
 
-        ai_row4 = tk.Frame(ai_manage_frame, bg=COLORS["bg_card"])
-        ai_row4.pack(fill=tk.X, pady=(2, 0))
+        ai_row6 = tk.Frame(ai_manage_frame, bg=COLORS["bg_card"])
+        ai_row6.pack(fill=tk.X, pady=(2, 0))
         self.paper_trade_check = tk.Checkbutton(
-            ai_row4, text="🧪 Paper Trading", font=("Segoe UI", 9, "bold"),
+            ai_row6, text="🧪 Paper Trading", font=("Segoe UI", 9, "bold"),
             variable=self.paper_trade_enabled, fg=COLORS["accent"],
             bg=COLORS["bg_card"], selectcolor=COLORS["bg_input"],
             activebackground=COLORS["bg_card"], activeforeground=COLORS["accent"],
             cursor="hand2"
         )
         self.paper_trade_check.pack(side=tk.LEFT)
-        self._create_runtime_badge(ai_row4, "paper_trade_enabled")
+        self._create_runtime_badge(ai_row6, "paper_trade_enabled")
 
         # Boss Mode section
         tk.Label(
@@ -1305,19 +1366,24 @@ class TradingBotGUI:
         card = self._make_card(parent, "📜 TRADE HISTORY", "รายการคำสั่งล่าสุดของ session นี้", collapsible=True, collapse_key="trade_history", start_collapsed=True)
 
         columns = ("time", "type", "price", "pnl")
+        columns = ("time", "type", "price", "pnl", "note")
         self.history_tree = ttk.Treeview(card, columns=columns, show="headings",
                                           height=5)
 
         for col, (text, width) in {
             "time": ("Time", 70),
-            "type": ("Type", 50),
-            "price": ("Price", 90),
-            "pnl": ("P/L %", 70),
+            "type": ("Type", 88),
+            "price": ("Price", 76),
+            "pnl": ("P/L %", 64),
+            "note": ("Note", 210),
         }.items():
             self.history_tree.heading(col, text=text)
             self.history_tree.column(col, width=width, anchor="center")
 
         self.history_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.history_tree.tag_configure("fee_guard", foreground=COLORS["yellow"])
+        self.history_tree.tag_configure("sell", foreground=COLORS["red"])
+        self.history_tree.tag_configure("buy", foreground=COLORS["green"])
 
     # ─── Helpers ──────────────────────────────────────────────
 
@@ -1430,6 +1496,10 @@ class TradingBotGUI:
             "ai_scale_in_loss_pct": lambda: float(self.ai_scale_in_loss_pct_var.get()),
             "ai_take_profit_enabled": lambda: bool(self.ai_take_profit_enabled.get()),
             "ai_take_profit_pct": lambda: float(self.ai_take_profit_pct_var.get()),
+            "profit_cashout_enabled": lambda: bool(self.profit_cashout_enabled.get()),
+            "profit_cashout_pct": lambda: float(self.profit_cashout_pct_var.get()),
+            "fee_guard_enabled": lambda: bool(self.fee_guard_enabled.get()),
+            "fee_guard_max_cost": lambda: float(self.fee_guard_max_cost_var.get()),
             "llm_trade_enabled": lambda: bool(self.llm_trade_enabled.get()),
             "paper_trade_enabled": lambda: bool(self.paper_trade_enabled.get()),
             "boss_mode": lambda: bool(self.boss_mode.get()),
@@ -1448,6 +1518,10 @@ class TradingBotGUI:
             self.ai_scale_in_loss_pct_var,
             self.ai_take_profit_enabled,
             self.ai_take_profit_pct_var,
+            self.profit_cashout_enabled,
+            self.profit_cashout_pct_var,
+            self.fee_guard_enabled,
+            self.fee_guard_max_cost_var,
             self.llm_trade_enabled,
             self.paper_trade_enabled,
             self.boss_mode,
@@ -1728,6 +1802,31 @@ class TradingBotGUI:
             text = f"{text} | ..."
         return self._truncate_ui_text(text, max_length)
 
+    def _format_decision_reason_block(self, reasons, max_items: int = 3, max_length: int = 180) -> str:
+        """Format reasons for the dashboard as short Thai bullet lines."""
+        normalized = []
+        seen = set()
+        for reason in (reasons or []):
+            translated = self._translate_decision_reason(" ".join(str(reason or "").split()))
+            if not translated:
+                continue
+            dedupe_key = translated.casefold()
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            normalized.append(self._truncate_ui_text(translated, max_length))
+            if len(normalized) >= max_items:
+                break
+
+        if not normalized:
+            return ""
+        return "\n".join(f"- {item}" for item in normalized)
+
+    def _join_decision_lines(self, *parts: str, max_length: int = 220) -> str:
+        """Join multiple dashboard detail lines while skipping blanks."""
+        lines = [str(part).strip() for part in parts if str(part or "").strip()]
+        return self._truncate_ui_text("\n".join(lines), max_length)
+
     def _translate_decision_reason(self, reason: str) -> str:
         """Translate strategy and risk reasons into Thai for the Decision Insight panel."""
         text = " ".join(str(reason or "").split())
@@ -1754,6 +1853,7 @@ class TradingBotGUI:
             (r"^Consecutive loss limit reached: (.+) >= (.+)$", lambda m: f"แพ้ติดต่อกันถึงลิมิตแล้ว: {m.group(1)} >= {m.group(2)}"),
             (r"^Max open positions reached: (.+) >= (.+)$", lambda m: f"จำนวน position เปิดพร้อมกันถึงลิมิตแล้ว: {m.group(1)} >= {m.group(2)}"),
             (r"^Insufficient balance: (.+) THB$", lambda m: f"ยอดเงินไม่พอ: {m.group(1)} THB"),
+            (r"^Small-position fee guard active: holding (.+) because loss (.+) THB \((.+)%\) is still within fee-noise buffer (.+) THB$", lambda m: f"หน่วงขายไม้เล็ก {m.group(1)} เพราะขาดทุน {m.group(2)} THB ({m.group(3)}%) ยังอยู่ในช่วง fee noise {m.group(4)} THB"),
         ]
 
         for pattern, formatter in patterns:
@@ -1771,6 +1871,7 @@ class TradingBotGUI:
             "Trend-buy setup detected: price is climbing and AI allows momentum entry": "เข้าเงื่อนไขซื้อตามเทรนด์: ราคากำลังขึ้นและ AI อนุญาตให้เข้าตามโมเมนตัม",
             "Uptrend pullback entry: AI waits for support, then buys on strength": "เข้าเงื่อนไขย่อในขาขึ้น: AI รอรับแถวแนวรับแล้วค่อยซื้อเมื่อแรงกลับมา",
             "Uptrend breakout entry confirmed above resistance": "เข้าเงื่อนไขทะลุแนวต้านขาขึ้นหลังผ่านแนวต้านแล้ว",
+            "Early recovery entry confirmed: market structure improved and AI found a low-chase entry": "เข้าเงื่อนไขฟื้นตัวระยะแรก: โครงสร้างตลาดเริ่มดีขึ้นและ AI หาโซนเข้าที่ไม่ไล่ราคา",
             "Counter-trend reversal allowed: strong AI rebound from support": "เข้าเงื่อนไขกลับตัวสวนเทรนด์: AI เห็นแรงเด้งจากแนวรับชัดเจน",
             "Downtrend protection active: waiting for EMA9 reclaim, bullish MACD, and strong AI volume confirmation": "ระบบกันตลาดขาลงกำลังทำงาน: รอราคา reclaim EMA9, MACD กลับตัว และปริมาณ/AI แข็งแรงก่อน",
             "Downtrend recovery confirmation passed: price reclaimed EMA9 with strong volume": "ยืนยันการฟื้นตัวในตลาดลงแล้ว: ราคา reclaim EMA9 พร้อมปริมาณซื้อขายหนุน",
@@ -1781,13 +1882,26 @@ class TradingBotGUI:
 
     def _build_buy_wait_hint(self, price: float, signals: Dict, buy_signal: Dict) -> str:
         """Explain the next price area the bot is waiting for before buying."""
+        ai_entry_plan = buy_signal.get("ai_entry_plan", {}) or {}
         buy_zone = buy_signal.get("buy_zone", {}) or {}
         zone_low = float(buy_zone.get("zone_low", 0.0) or 0.0)
         zone_high = float(buy_zone.get("zone_high", 0.0) or 0.0)
         support_level = float(signals.get("support_level", 0.0) or 0.0)
         resistance_level = float(signals.get("resistance_level", 0.0) or 0.0)
+        preferred_entry = float(ai_entry_plan.get("preferred_entry", 0.0) or 0.0)
+        trigger_price = float(ai_entry_plan.get("trigger_price", 0.0) or 0.0)
+        chase_limit = float(ai_entry_plan.get("chase_limit", 0.0) or 0.0)
+        plan_label = str(ai_entry_plan.get("label", "") or "")
 
         hints = []
+        if preferred_entry > 0 and chase_limit > 0:
+            if price > chase_limit:
+                hints.append(f"AI รอราคาเข้ากลับโซน {preferred_entry:,.2f}-{chase_limit:,.2f}")
+            elif trigger_price > 0 and price < trigger_price:
+                hints.append(f"AI รอให้ราคายืนเหนือ {trigger_price:,.2f} ก่อนเข้า")
+            elif plan_label:
+                hints.append(f"AI มองโซนเข้า {preferred_entry:,.2f} | {plan_label}")
+
         if zone_low > 0 and zone_high > 0:
             if price > zone_high:
                 hints.append(f"รอราคาเข้าโซนซื้อ {zone_low:,.2f}-{zone_high:,.2f}")
@@ -1818,12 +1932,21 @@ class TradingBotGUI:
 
         buy_signal = self.strategy.should_buy(signals, ai_prediction)
         reason_text = self._format_reason_list(buy_signal.get("reasons", []))
+        reason_block = self._format_decision_reason_block(buy_signal.get("reasons", []), max_items=3, max_length=104)
         wait_hint = self._build_buy_wait_hint(current_price, signals, buy_signal)
+        ai_entry_plan = buy_signal.get("ai_entry_plan", {}) or {}
+        preferred_entry = float(ai_entry_plan.get("preferred_entry", 0.0) or 0.0)
         score_text = f"คะแนน {float(buy_signal.get('score', 0.0) or 0.0):.2f}/{self.config.trading.min_buy_signal_score:.2f}"
 
         if action_name == "BUY":
-            detail = f"ซื้อที่ {current_price:,.2f} | {reason_text or score_text}"
-            return {"status": "📈 ซื้อ", "detail": self._truncate_ui_text(detail, 180), "color": COLORS["green"]}
+            detail = self._join_decision_lines(
+                f"ซื้อที่ {current_price:,.2f}",
+                f"สรุป: {score_text}",
+                reason_block or reason_text,
+            )
+            if preferred_entry > 0:
+                detail = self._join_decision_lines(detail, f"AI มองจุดเข้าแถว {preferred_entry:,.2f}")
+            return {"status": "📈 ซื้อ", "detail": detail, "color": COLORS["green"]}
 
         if action_name in {"AUTO_REBUY", "BOSS_BUYBACK"}:
             return {
@@ -1832,7 +1955,7 @@ class TradingBotGUI:
                 "color": COLORS["green"],
             }
 
-        if action_name in {"SELL", "STOP_LOSS", "TAKE_PROFIT", "AI_CUTLOSS", "AI_TAKE_PROFIT", "AI_BOSS_CUTLOSS"}:
+        if action_name in {"SELL", "STOP_LOSS", "TAKE_PROFIT", "AI_CUTLOSS", "AI_TAKE_PROFIT", "AI_BOSS_CUTLOSS", "PROFIT_CASHOUT", "AI_PROFIT_CASHOUT"}:
             action_label_map = {
                 "SELL": "ขาย",
                 "STOP_LOSS": "ตัดขาดทุน",
@@ -1840,41 +1963,58 @@ class TradingBotGUI:
                 "AI_CUTLOSS": "AI ตัดขาดทุน",
                 "AI_TAKE_PROFIT": "AI ทำกำไร",
                 "AI_BOSS_CUTLOSS": "Boss AI ตัดขาดทุน",
+                "PROFIT_CASHOUT": "ถอนกำไร",
+                "AI_PROFIT_CASHOUT": "AI ถอนกำไร",
             }
             return {
                 "status": f"📉 {action_label_map.get(action_name, action_name)}",
-                "detail": f"ปิดสถานะที่ {current_price:,.2f} แล้ว รอระบบประเมินจังหวะรอบถัดไป",
+                "detail": (
+                    f"ถอนกำไรบางส่วนที่ {current_price:,.2f} แล้ว เหลือเงินต้นไว้ในเหรียญ"
+                    if "CASHOUT" in action_name else
+                    f"ปิดสถานะที่ {current_price:,.2f} แล้ว รอระบบประเมินจังหวะรอบถัดไป"
+                ),
                 "color": COLORS["red"] if "LOSS" in action_name or "SELL" in action_name else COLORS["yellow"],
             }
 
         if action_name in {"INVALID_AUTO_BUY", "INSUFFICIENT_AUTO_BUY"}:
-            detail = f"ยังไม่ซื้อ | {reason_text or score_text}"
-            if wait_hint:
-                detail = f"{detail} | {wait_hint}"
-            return {"status": "⚠️ ซื้อไม่ได้", "detail": self._truncate_ui_text(detail, 180), "color": COLORS["yellow"]}
+            detail = self._join_decision_lines(
+                "ยังไม่ซื้อ",
+                f"สรุป: {reason_text or score_text}",
+                wait_hint,
+                reason_block,
+            )
+            return {"status": "⚠️ ซื้อไม่ได้", "detail": detail, "color": COLORS["yellow"]}
 
         if positions:
             position_summary = self._get_runtime_position_summary(current_price)
             detail = position_summary["label"]
             if buy_signal.get("should_buy"):
-                detail = f"มีสถานะค้างอยู่แล้ว | ซื้อเพิ่มเมื่อกำไรเฉลี่ยเกิน +1.00% | {detail}"
+                detail = self._join_decision_lines(
+                    "มีสถานะค้างอยู่แล้ว",
+                    "จะซื้อเพิ่มเมื่อกำไรเฉลี่ยเกิน +1.00%",
+                    detail,
+                )
             elif reason_text:
-                detail = f"ถืออยู่ | {detail} | {reason_text}"
-            return {"status": "🟡 ถือต่อ", "detail": self._truncate_ui_text(detail, 180), "color": COLORS["yellow"]}
+                detail = self._join_decision_lines("ถืออยู่", detail, reason_block or reason_text)
+            return {"status": "🟡 ถือต่อ", "detail": detail, "color": COLORS["yellow"]}
 
         if risk_check and not risk_check.get("allowed", True):
             risk_text = self._format_reason_list(risk_check.get("reasons", []), max_items=2, max_length=140)
-            detail = f"พักการซื้อ | {risk_text or 'ติดข้อจำกัดความเสี่ยง'}"
-            if wait_hint:
-                detail = f"{detail} | {wait_hint}"
-            return {"status": "⏸️ พักซื้อ", "detail": self._truncate_ui_text(detail, 180), "color": COLORS["yellow"]}
+            detail = self._join_decision_lines(
+                "พักการซื้อ",
+                risk_text or "ติดข้อจำกัดความเสี่ยง",
+                wait_hint,
+                reason_block,
+            )
+            return {"status": "⏸️ พักซื้อ", "detail": detail, "color": COLORS["yellow"]}
 
-        detail = f"ยังไม่ซื้อ | {score_text}"
-        if wait_hint:
-            detail = f"{detail} | {wait_hint}"
-        if reason_text:
-            detail = f"{detail} | {reason_text}"
-        return {"status": "⏳ รอซื้อ", "detail": self._truncate_ui_text(detail, 180), "color": COLORS["text_bright"]}
+        detail = self._join_decision_lines(
+            "ยังไม่ซื้อ",
+            f"สรุป: {score_text}",
+            wait_hint,
+            reason_block or reason_text,
+        )
+        return {"status": "⏳ รอซื้อ", "detail": detail, "color": COLORS["text_bright"]}
 
     def _apply_decision_snapshot(self, snapshot: Dict):
         """Apply the current decision summary to the dashboard widgets."""
@@ -2031,19 +2171,32 @@ class TradingBotGUI:
 
     def _execute_paper_sell(self, position: Position, price: float, reason: str,
                             arm_auto_reentry: bool = True,
-                            history_type: str = "P-SELL") -> Optional[Dict]:
+                            history_type: str = "P-SELL",
+                            keep_principal: bool = False) -> Optional[Dict]:
         """Execute a simulated sell without sending an exchange order."""
         if price <= 0:
             self.root.after(0, self._log, "❌ Paper sell failed: invalid market price", "ERROR")
             return None
 
-        record = self.strategy.close_position(position, price, reason)
+        if keep_principal:
+            cashout_plan = self.strategy.evaluate_profit_cashout(position, price)
+            if cashout_plan["should_cashout"]:
+                record = self.strategy.cash_out_profit(
+                    position,
+                    price,
+                    float(cashout_plan["sell_amount"] or 0.0),
+                    reason,
+                )
+            else:
+                record = self.strategy.close_position(position, price, reason)
+        else:
+            record = self.strategy.close_position(position, price, reason)
         if not record:
             return None
 
         self.paper_balance_thb += float(record.get("net_exit_value_thb", 0.0) or 0.0)
         self.risk_manager.record_trade_result(record["profit_thb"])
-        if self.bot_running and arm_auto_reentry and reason != "MANUAL_SELL":
+        if self.bot_running and arm_auto_reentry and reason != "MANUAL_SELL" and not record.get("partial_close"):
             self._arm_auto_reentry(
                 position.symbol,
                 price,
@@ -2056,7 +2209,8 @@ class TradingBotGUI:
             self.bot_win_trades += 1
         else:
             self.bot_lose_trades += 1
-        self.root.after(0, self._add_history_entry, history_type, price, record["profit_pct"])
+        effective_history_type = "P-CASHOUT" if record.get("partial_close") else history_type
+        self.root.after(0, self._add_history_entry, effective_history_type, price, record["profit_pct"])
         self.root.after(0, self._update_pnl_display, price)
         self.root.after(0, self._update_balance_display, self.paper_balance_thb, price)
         return record
@@ -2911,7 +3065,9 @@ class TradingBotGUI:
         )
         self._log(
             f"  AI Scale-In: {'ON' if self.config.trading.ai_scale_in_enabled else 'OFF'} @ -{self.config.trading.ai_scale_in_loss_pct}% | "
-            f"AI Take Profit: {'ON' if self.config.trading.ai_take_profit_enabled else 'OFF'} @ +{self.config.trading.ai_take_profit_min_profit_pct}%",
+            f"AI Take Profit: {'ON' if self.config.trading.ai_take_profit_enabled else 'OFF'} @ +{self.config.trading.ai_take_profit_min_profit_pct}% | "
+            f"Profit Cashout: {'ON' if self.config.trading.profit_cashout_enabled else 'OFF'} @ +{self.config.trading.profit_cashout_min_profit_pct}% | "
+            f"Fee Guard: {'ON' if self.config.trading.small_position_fee_guard_enabled else 'OFF'} ≤ ฿{self.config.trading.small_position_fee_guard_max_cost_thb:,.0f}",
             "INFO",
         )
         self._log(f"  Auto Buy Amount: ฿{startup_context['auto_buy_amount']:,.2f}", "INFO")
@@ -2940,12 +3096,14 @@ class TradingBotGUI:
             take_profit_pct = float(self.tp_var.get())
             ai_scale_in_loss_pct = float(self.ai_scale_in_loss_pct_var.get())
             ai_take_profit_pct = float(self.ai_take_profit_pct_var.get())
+            profit_cashout_pct = float(self.profit_cashout_pct_var.get())
+            fee_guard_max_cost = float(self.fee_guard_max_cost_var.get())
             auto_buy_amount = float(self.auto_trade_amount_var.get())
         except ValueError:
             if show_popup:
                 messagebox.showerror(
                     "Settings Error",
-                    "ค่า Interval, SL, TP, AI Loss, AI Profit หรือ Auto Buy ไม่ถูกต้อง",
+                    "ค่า Interval, SL, TP, AI Loss, AI Profit, Profit Cashout, Fee Guard หรือ Auto Buy ไม่ถูกต้อง",
                 )
             elif not self._runtime_settings_invalid:
                 self.root.after(
@@ -2985,6 +3143,10 @@ class TradingBotGUI:
         self.config.trading.ai_scale_in_loss_pct = ai_scale_in_loss_pct
         self.config.trading.ai_take_profit_enabled = self.ai_take_profit_enabled.get()
         self.config.trading.ai_take_profit_min_profit_pct = ai_take_profit_pct
+        self.config.trading.profit_cashout_enabled = self.profit_cashout_enabled.get()
+        self.config.trading.profit_cashout_min_profit_pct = profit_cashout_pct
+        self.config.trading.small_position_fee_guard_enabled = self.fee_guard_enabled.get()
+        self.config.trading.small_position_fee_guard_max_cost_thb = fee_guard_max_cost
         self.config.trading.symbol = applied_symbol
         self.config.trading.paper_trade_enabled = self.paper_trade_enabled.get()
 
@@ -2998,6 +3160,10 @@ class TradingBotGUI:
             "ai_scale_in_loss_pct": ai_scale_in_loss_pct,
             "ai_take_profit_enabled": self.config.trading.ai_take_profit_enabled,
             "ai_take_profit_pct": ai_take_profit_pct,
+            "profit_cashout_enabled": self.config.trading.profit_cashout_enabled,
+            "profit_cashout_pct": profit_cashout_pct,
+            "fee_guard_enabled": self.config.trading.small_position_fee_guard_enabled,
+            "fee_guard_max_cost": fee_guard_max_cost,
             "boss_mode": self.boss_mode.get(),
             "paper_trade_enabled": self.paper_trade_enabled.get(),
             "boss_cutloss": float(self.boss_cutloss_pct_var.get()),
@@ -3011,7 +3177,7 @@ class TradingBotGUI:
             self.root.after(
                 0,
                 self._log,
-                f"อัปเดตพารามิเตอร์สด | Interval {interval}s | SL {stop_loss_pct}% | TP {take_profit_pct}% | Auto Buy ฿{auto_buy_amount:,.2f} | Mode {'PAPER' if self.paper_trade_enabled.get() else 'LIVE'}",
+                f"อัปเดตพารามิเตอร์สด | Interval {interval}s | SL {stop_loss_pct}% | TP {take_profit_pct}% | Cashout {'ON' if self.profit_cashout_enabled.get() else 'OFF'} @ +{profit_cashout_pct}% | Fee Guard {'ON' if self.fee_guard_enabled.get() else 'OFF'} ≤ ฿{fee_guard_max_cost:,.0f} | Auto Buy ฿{auto_buy_amount:,.2f} | Mode {'PAPER' if self.paper_trade_enabled.get() else 'LIVE'}",
                 "INFO",
             )
 
@@ -3035,6 +3201,25 @@ class TradingBotGUI:
         self._log("Bot STOPPED", "WARN")
         self._refresh_runtime_badges()
         self._refresh_quick_start_summary()
+
+    def _on_window_close_request(self):
+        """Require the bot to be stopped before the GUI window can be closed."""
+        if self._bot_start_in_progress:
+            messagebox.showwarning(
+                "Bot Starting",
+                "ระบบกำลังเริ่มบอทอยู่ กรุณารอให้เริ่มเสร็จหรือกดหยุดบอทก่อน แล้วค่อยปิดโปรแกรม",
+            )
+            return
+
+        if self.bot_running:
+            messagebox.showwarning(
+                "Stop Bot First",
+                "ต้องกด STOP BOT ให้เรียบร้อยก่อน จึงจะปิดโปรแกรมได้",
+            )
+            self._log("บล็อกการปิดโปรแกรม: ต้องหยุดบอทก่อน", "WARN")
+            return
+
+        self.root.destroy()
 
     def _trading_loop(self):
         """Background trading loop (runs in thread)."""
@@ -3907,8 +4092,19 @@ class TradingBotGUI:
                     "reason": f"LLM_TAKE_PROFIT: {llm_tp_advice.get('reason', '')}",
                 }
             if ai_take_profit["should_sell"]:
-                record = self._do_sell(pos, current_price, ai_take_profit["reason"], arm_auto_reentry=False)
+                record = self._do_sell(
+                    pos,
+                    current_price,
+                    ai_take_profit["reason"],
+                    arm_auto_reentry=False,
+                    keep_principal=self._should_keep_principal_on_sell(ai_take_profit["reason"]),
+                )
                 if record:
+                    if record.get("partial_close"):
+                        self.root.after(0, self._log,
+                            f"💸 AI PROFIT CASHOUT @ {current_price:,.2f} | ถอนกำไร {record['net_exit_value_thb']:,.2f} THB | คงเงินต้นไว้ใน {pos.symbol}",
+                            "TRADE")
+                        return "AI_PROFIT_CASHOUT"
                     self.root.after(0, self._log,
                         f"🤖 AI TAKE PROFIT @ {current_price:,.2f} | "
                         f"ขายกลับเป็น THB | กำไร: {ai_take_profit['profit_thb']:,.2f} THB ({ai_take_profit['profit_pct']:+.2f}%)",
@@ -3919,8 +4115,13 @@ class TradingBotGUI:
                 pnl = self.strategy.get_position_pnl(pos, current_price)
                 pnl_thb = pnl["profit_thb"]
                 pnl_pct = pnl["profit_pct"]
-                record = self._do_sell(pos, current_price, "TAKE_PROFIT_TO_THB", arm_auto_reentry=False)
+                record = self._do_sell(pos, current_price, "TAKE_PROFIT_TO_THB", arm_auto_reentry=False, keep_principal=True)
                 if record:
+                    if record.get("partial_close"):
+                        self.root.after(0, self._log,
+                            f"💸 PROFIT CASHOUT @ {current_price:,.2f} | ถอนกำไร {record['net_exit_value_thb']:,.2f} THB | เงินต้นยังถือในเหรียญ",
+                            "TRADE")
+                        return "PROFIT_CASHOUT"
                     self.root.after(0, self._log,
                         f"🟢 TAKE PROFIT @ {current_price:,.2f} | "
                         f"ขายกลับเป็น THB | กำไร: {pnl_thb:,.2f} THB ({pnl_pct:+.2f}%)",
@@ -3953,8 +4154,18 @@ class TradingBotGUI:
                 rl_decision,
             )
             if ai_take_profit["should_sell"]:
-                record = self._do_sell(pos, current_price, ai_take_profit["reason"])
+                record = self._do_sell(
+                    pos,
+                    current_price,
+                    ai_take_profit["reason"],
+                    keep_principal=self._should_keep_principal_on_sell(ai_take_profit["reason"]),
+                )
                 if record:
+                    if record.get("partial_close"):
+                        self.root.after(0, self._log,
+                                        f"💸 AI PROFIT CASHOUT @ {current_price:,.2f} | ถอนกำไร {record['net_exit_value_thb']:,.2f} THB | คงเงินต้นไว้ในเหรียญ",
+                                        "TRADE")
+                        return "AI_PROFIT_CASHOUT"
                     self.root.after(0, self._log,
                                     f"🤖 AI TAKE PROFIT @ {current_price:,.2f} | "
                                     f"ขายกลับเป็น THB | กำไร: {ai_take_profit['profit_thb']:,.2f} THB ({ai_take_profit['profit_pct']:+.2f}%)",
@@ -4000,8 +4211,13 @@ class TradingBotGUI:
                     return "STOP_LOSS"
 
             if self.strategy.check_take_profit(pos, current_price):
-                record = self._do_sell(pos, current_price, "TAKE_PROFIT_TO_THB")
+                record = self._do_sell(pos, current_price, "TAKE_PROFIT_TO_THB", keep_principal=True)
                 if record:
+                    if record.get("partial_close"):
+                        self.root.after(0, self._log,
+                                        f"💸 PROFIT CASHOUT @ {current_price:,.2f} | ถอนกำไร {record['net_exit_value_thb']:,.2f} THB | เงินต้นยังถือในเหรียญ",
+                                        "TRADE")
+                        return "PROFIT_CASHOUT"
                     trigger_buffer_pct = max(getattr(self.config.trading, "reentry_trigger_buffer_pct", 0.05), 0.0)
                     self.root.after(0, self._log,
                                     f"🟢 TAKE PROFIT @ {current_price:,.2f} | "
@@ -4210,10 +4426,17 @@ class TradingBotGUI:
                     sell["reasons"] = list(sell.get("reasons", [])) + [f"LLM: {sell_gate['reason']}"]
 
                 if not should_sell:
+                    self._track_fee_guard_history(symbol, price, for_sell_pnl_pct, sell)
                     continue
+                self._track_fee_guard_history(symbol, price, for_sell_pnl_pct, sell)
                 sold_any = True
                 last_reasons = "; ".join(sell["reasons"])
-                self._do_sell(pos, price, "SELL_SIGNAL")
+                self._do_sell(
+                    pos,
+                    price,
+                    "SELL_SIGNAL",
+                    keep_principal=self._should_keep_principal_on_sell("SELL_SIGNAL", sell),
+                )
                 self.root.after(0, self._log,
                     f"📉 SELL signal | P/L: {for_sell_pnl_thb:+,.2f} THB ({for_sell_pnl_pct:+.2f}%)",
                     "TRADE")
@@ -4398,8 +4621,21 @@ class TradingBotGUI:
                             "BUY", exec_price, 0)
             self.root.after(0, self._update_pnl_display, exec_price)
 
+    def _should_keep_principal_on_sell(self, reason: str, sell_decision: Optional[Dict] = None) -> bool:
+        """Return True when the sell should skim gains into THB instead of closing the whole position."""
+        if not getattr(self.config.trading, "profit_cashout_enabled", False):
+            return False
+        if sell_decision is not None:
+            return bool(
+                (sell_decision.get("profit_lock_sell") or sell_decision.get("extended_rally_sell"))
+                and not sell_decision.get("panic_sell")
+            )
+        upper_reason = str(reason or "").upper()
+        return "TAKE_PROFIT" in upper_reason and "CUTLOSS" not in upper_reason and "STOP_LOSS" not in upper_reason
+
     def _do_sell(self, position: Position, price: float, reason: str,
-                 arm_auto_reentry: bool = True):
+                 arm_auto_reentry: bool = True,
+                 keep_principal: bool = False):
         """Execute sell order back into THB."""
         if self._is_paper_trade_mode():
             return self._execute_paper_sell(
@@ -4407,26 +4643,47 @@ class TradingBotGUI:
                 price,
                 reason,
                 arm_auto_reentry=arm_auto_reentry,
+                keep_principal=keep_principal,
             )
         if not self.client:
             return
 
-        estimated_value = position.amount * price
+        cashout_plan = None
+        sell_amount = position.amount
+        if keep_principal:
+            cashout_plan = self.strategy.evaluate_profit_cashout(position, price)
+            if cashout_plan["should_cashout"]:
+                sell_amount = float(cashout_plan["sell_amount"] or 0.0)
+            else:
+                keep_principal = False
+                sell_amount = position.amount
+
+        estimated_value = sell_amount * price
         if estimated_value < 10:
-            if position in self.strategy.positions:
+            if not keep_principal and position in self.strategy.positions:
                 self.strategy.positions.remove(position)
             self.root.after(
                 0,
                 self._log,
-                f"⚠️ ข้ามการขาย {position.symbol} เพราะมูลค่าคงเหลือเพียง {estimated_value:,.2f} THB ซึ่งต่ำกว่าขั้นต่ำ Bitkub; ตัดออกจากการติดตามของบอทแล้ว",
+                (
+                    f"⚠️ ข้ามการถอนกำไร {position.symbol} เพราะมูลค่าน้อยเพียง {estimated_value:,.2f} THB ซึ่งต่ำกว่าขั้นต่ำ Bitkub"
+                    if keep_principal else
+                    f"⚠️ ข้ามการขาย {position.symbol} เพราะมูลค่าคงเหลือเพียง {estimated_value:,.2f} THB ซึ่งต่ำกว่าขั้นต่ำ Bitkub; ตัดออกจากการติดตามของบอทแล้ว"
+                ),
                 "WARN",
             )
             return None
 
-        order = self.client.create_sell_order(position.symbol, position.amount)
+        order = self.client.create_sell_order(position.symbol, sell_amount)
         if "_error" in order:
-            self.root.after(0, self._log,
-                f"❌ Auto-sell failed: error {order['_error']} | {order.get('_raw', '')}", "ERROR")
+            err = order.get("_error")
+            raw = order.get("_raw", "")
+            if err == 18:
+                self.root.after(0, self._log,
+                    f"❌ Auto-sell failed: insufficient balance (error 18) - {raw}", "ERROR")
+            else:
+                self.root.after(0, self._log,
+                    f"❌ Auto-sell failed: error {err} | {raw}", "ERROR")
             return
         if not order:
             self.root.after(0, self._log,
@@ -4438,15 +4695,24 @@ class TradingBotGUI:
             if exit_price <= 0:
                 exit_price = price
 
-        record = self.strategy.close_position(
-            position,
-            exit_price,
-            reason,
-            net_exit_value_thb=float(order.get("received", 0.0) or 0.0),
-        )
+        if keep_principal and cashout_plan and cashout_plan["should_cashout"]:
+            record = self.strategy.cash_out_profit(
+                position,
+                exit_price,
+                float(order.get("amount", sell_amount) or sell_amount),
+                reason,
+                net_exit_value_thb=float(order.get("received", 0.0) or 0.0),
+            )
+        else:
+            record = self.strategy.close_position(
+                position,
+                exit_price,
+                reason,
+                net_exit_value_thb=float(order.get("received", 0.0) or 0.0),
+            )
         if record:
             self.risk_manager.record_trade_result(record["profit_thb"])
-            if self.bot_running and arm_auto_reentry and reason != "MANUAL_SELL":
+            if self.bot_running and arm_auto_reentry and reason != "MANUAL_SELL" and not record.get("partial_close"):
                 self._arm_auto_reentry(
                     position.symbol,
                     exit_price,
@@ -4460,8 +4726,9 @@ class TradingBotGUI:
                 self.bot_win_trades += 1
             else:
                 self.bot_lose_trades += 1
+            history_type = "CASHOUT" if record.get("partial_close") else "SELL"
             self.root.after(0, self._add_history_entry,
-                            "SELL", exit_price, record["profit_pct"])
+                            history_type, exit_price, record["profit_pct"])
             self.root.after(0, self._update_pnl_display, exit_price)
             return record
 
@@ -4478,6 +4745,59 @@ class TradingBotGUI:
         self.bot_uptime_str.set(f"{h:02d}:{m:02d}:{s:02d}")
         self.root.after(1000, self._start_uptime_timer)
 
+    def _format_last_loss_source(self) -> str:
+        """Describe the latest realized losing trade shown in the status card."""
+        for record in reversed(self.strategy.trade_history):
+            profit_thb = float(record.get("profit_thb", 0.0) or 0.0)
+            if profit_thb >= 0:
+                continue
+            symbol = str(record.get("symbol", "-") or "-")
+            exit_price = float(record.get("exit_price", 0.0) or 0.0)
+            profit_pct = float(record.get("profit_pct", 0.0) or 0.0)
+            reason = str(record.get("reason", "") or "-")
+            return (
+                f"ขาดทุนที่ปิดล่าสุด: {symbol} {profit_thb:+,.2f} THB ({profit_pct:+.2f}%) "
+                f"| ออก {exit_price:,.2f} | เหตุผล {self._truncate_ui_text(reason, 54)}"
+            )
+        return "ขาดทุนที่ปิดล่าสุด: ยังไม่มี"
+
+    def _format_unrealized_source(self, current_price: float) -> str:
+        """Describe the open position contributing the most to current floating P/L."""
+        if not self.strategy.positions:
+            return "ลอยตัวตอนนี้: ยังไม่มี position"
+
+        ranked_positions = []
+        for pos in self.strategy.positions:
+            pnl = self.strategy.get_position_pnl(pos, current_price)
+            ranked_positions.append((abs(float(pnl.get("profit_thb", 0.0) or 0.0)), pos, pnl))
+
+        if not ranked_positions:
+            return "ลอยตัวตอนนี้: ยังไม่มี position"
+
+        _, position, pnl = max(ranked_positions, key=lambda item: item[0])
+        profit_thb = float(pnl.get("profit_thb", 0.0) or 0.0)
+        profit_pct = float(pnl.get("profit_pct", 0.0) or 0.0)
+        direction_text = "ขาดทุนลอยตัว" if profit_thb < 0 else "กำไรลอยตัว"
+        return (
+            f"ลอยตัวตอนนี้: {position.symbol} {direction_text} {profit_thb:+,.2f} THB ({profit_pct:+.2f}%) "
+            f"| เข้า {position.entry_price:,.2f} | ตอนนี้ {current_price:,.2f}"
+        )
+
+    def _track_fee_guard_history(self, symbol: str, current_price: float,
+                                 pnl_pct: float, sell_decision: Optional[Dict] = None):
+        """Write a single Trade History row when fee guard delays a sell for a symbol."""
+        active = bool((sell_decision or {}).get("fee_guard_active"))
+        if active:
+            if self._fee_guard_history_state.get(symbol):
+                return
+            reasons = list((sell_decision or {}).get("reasons", []))
+            note = f"{symbol} | {self._format_reason_list(reasons, max_items=1, max_length=104)}"
+            self._add_history_entry("FEE-GUARD", current_price, pnl_pct, note=note, tag="fee_guard")
+            self._fee_guard_history_state[symbol] = True
+            return
+
+        self._fee_guard_history_state.pop(symbol, None)
+
     def _update_bot_performance(self, current_price: float):
         """Refresh the bot status & performance card."""
         # Realized P/L
@@ -4490,6 +4810,9 @@ class TradingBotGUI:
         unrealized = 0.0
         for pos in self.strategy.positions:
             unrealized += self.strategy.get_position_pnl(pos, current_price)["profit_thb"]
+        self.bot_unrealized_pnl_str.set(f"{unrealized:+,.2f} THB")
+        clr_u = COLORS["green"] if unrealized >= 0 else COLORS["red"]
+        self._perf_labels["unrealized_pnl"].config(fg=clr_u)
         total_pnl = realized + unrealized
         self.bot_total_pnl_str.set(f"{total_pnl:+,.2f} THB")
         clr_t = COLORS["green"] if total_pnl >= 0 else COLORS["red"]
@@ -4511,6 +4834,8 @@ class TradingBotGUI:
                   f"✅ ชนะ: {self.bot_win_trades}  |  "
                   f"❌ แพ้: {self.bot_lose_trades}"
         )
+        self.bot_last_loss_source_str.set(self._format_last_loss_source())
+        self.bot_unrealized_source_str.set(self._format_unrealized_source(current_price))
 
         # Boss mode status
         snapshot = self._get_boss_runtime_snapshot(current_price)
@@ -4712,12 +5037,24 @@ class TradingBotGUI:
         summary = " | ".join(summaries)
         self.pnl_summary_label.config(text=summary, fg=color)
 
-    def _add_history_entry(self, trade_type: str, price: float, pnl: float):
+    def _add_history_entry(self, trade_type: str, price: float, pnl: float,
+                           note: str = "", tag: str = ""):
         """Add entry to trade history table."""
         now = datetime.now().strftime("%H:%M:%S")
-        self.history_tree.insert("", 0, values=(
-            now, trade_type, f"{price:,.2f}", f"{pnl:+.2f}%"
-        ))
+        resolved_tag = tag
+        if not resolved_tag:
+            if "BUY" in trade_type:
+                resolved_tag = "buy"
+            elif trade_type in {"SELL", "P-SELL", "CASHOUT", "P-CASHOUT"}:
+                resolved_tag = "sell"
+            elif "FEE-GUARD" in trade_type:
+                resolved_tag = "fee_guard"
+        self.history_tree.insert(
+            "",
+            0,
+            values=(now, trade_type, f"{price:,.2f}", f"{pnl:+.2f}%", self._truncate_ui_text(note, 72)),
+            tags=(resolved_tag,) if resolved_tag else (),
+        )
 
     def _manual_refresh(self):
         """Manual data refresh."""

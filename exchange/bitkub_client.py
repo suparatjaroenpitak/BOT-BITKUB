@@ -108,6 +108,8 @@ class BitkubClient:
                 6: "Invalid signature",
                 8: "Invalid timestamp",
                 11: "Invalid symbol",
+                15: "Order value below minimum",
+                18: "Insufficient balance / amount exceeds available",
             }
             err_text = error_msgs.get(error_code, f"Unknown error ({error_code})")
             self.logger.log_error(f"API {path}", Exception(f"Bitkub error {error_code}: {err_text}"))
@@ -330,6 +332,21 @@ class BitkubClient:
         """Create a sell order. Always uses limit order with market price if no price given."""
         try:
             market_sym = symbol.lower()  # btc_thb (no flip for v3)
+
+            # quick pre-flight: ensure we don't try selling more crypto than available
+            # (Bitkub returns code 18 in that case, which confused users).
+            try:
+                balances = self.get_balance_detail()
+                base_coin = symbol.split("_")[0].upper()
+                avail = balances.get(base_coin, {}).get("available", 0)
+                if amount_crypto > avail + 1e-12:  # allow tiny rounding slack
+                    return {
+                        "_error": 18,
+                        "_raw": {"msg": "Insufficient available balance", "available": avail, "requested": amount_crypto},
+                    }
+            except Exception:
+                # ignore failure to fetch balance, we'll let the API return its own error
+                pass
 
             # Always use limit order — Bitkub market orders (rat=0) are unreliable
             if not price:

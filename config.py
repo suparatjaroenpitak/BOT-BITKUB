@@ -48,14 +48,28 @@ class TradingConfig:
     dip_buy_rsi_max: float = 40.0
     dip_buy_max_ai_down_confidence: float = 0.60
     trend_buy_min_ai_confidence: float = 0.52
+    early_recovery_min_ai_confidence: float = 0.58
+    early_recovery_min_volume_ratio: float = 1.05
+    ai_entry_zone_buffer_pct: float = 0.45
+    ai_entry_max_chase_pct: float = 0.75
     downtrend_recovery_min_ai_confidence: float = 0.74
     downtrend_recovery_min_volume_ratio: float = 1.15
     downtrend_rsi_ceiling: float = 36.0
+    dump_guard_enabled: bool = True
+    dump_single_candle_drop_pct: float = 1.10
+    dump_three_candle_drop_pct: float = 2.20
+    dump_near_low_buffer_pct: float = 0.35
+    dump_volume_ratio_min: float = 1.20
     quick_profit_sell_pct: float = 1.2
     extended_profit_sell_pct: float = 2.8
     profit_lock_rsi_threshold: float = 66.0
     buy_fee_rate: float = 0.0027
     sell_fee_rate: float = 0.0027
+    small_position_fee_guard_enabled: bool = True
+    small_position_fee_guard_max_cost_thb: float = 250.0
+    small_position_fee_guard_min_loss_buffer_thb: float = 1.5
+    small_position_fee_guard_fee_multiple: float = 2.5
+    small_position_fee_guard_max_loss_pct: float = 1.8
 
     # Stop Loss / Take Profit (percentage)
     stop_loss_pct: float = 1.40
@@ -99,6 +113,9 @@ class TradingConfig:
     ai_take_profit_min_profit_pct: float = 1.2
     ai_take_profit_min_lstm_confidence: float = 0.35
     ai_take_profit_min_rl_confidence: float = 0.25
+    profit_cashout_enabled: bool = True
+    profit_cashout_min_profit_pct: float = 1.6
+    profit_cashout_min_thb: float = 25.0
 
 
 @dataclass
@@ -216,6 +233,26 @@ class AppConfig:
             config.trading.dip_buy_max_ai_down_confidence = float(dip_buy_ai_down_conf)
         if trend_buy_ai_conf := os.environ.get("TREND_BUY_MIN_AI_CONFIDENCE"):
             config.trading.trend_buy_min_ai_confidence = float(trend_buy_ai_conf)
+        if early_recovery_ai_conf := os.environ.get("EARLY_RECOVERY_MIN_AI_CONFIDENCE"):
+            config.trading.early_recovery_min_ai_confidence = float(early_recovery_ai_conf)
+        if early_recovery_volume := os.environ.get("EARLY_RECOVERY_MIN_VOLUME_RATIO"):
+            config.trading.early_recovery_min_volume_ratio = float(early_recovery_volume)
+        if ai_entry_buffer := os.environ.get("AI_ENTRY_ZONE_BUFFER_PCT"):
+            config.trading.ai_entry_zone_buffer_pct = float(ai_entry_buffer)
+        if ai_entry_chase := os.environ.get("AI_ENTRY_MAX_CHASE_PCT"):
+            config.trading.ai_entry_max_chase_pct = float(ai_entry_chase)
+        if dump_guard_enabled := os.environ.get("DUMP_GUARD_ENABLED"):
+            config.trading.dump_guard_enabled = dump_guard_enabled.lower() in {
+                "1", "true", "yes", "on",
+            }
+        if dump_single_drop := os.environ.get("DUMP_SINGLE_CANDLE_DROP_PCT"):
+            config.trading.dump_single_candle_drop_pct = float(dump_single_drop)
+        if dump_three_drop := os.environ.get("DUMP_THREE_CANDLE_DROP_PCT"):
+            config.trading.dump_three_candle_drop_pct = float(dump_three_drop)
+        if dump_low_buffer := os.environ.get("DUMP_NEAR_LOW_BUFFER_PCT"):
+            config.trading.dump_near_low_buffer_pct = float(dump_low_buffer)
+        if dump_volume_ratio := os.environ.get("DUMP_VOLUME_RATIO_MIN"):
+            config.trading.dump_volume_ratio_min = float(dump_volume_ratio)
         if quick_profit_sell := os.environ.get("QUICK_PROFIT_SELL_PCT"):
             config.trading.quick_profit_sell_pct = float(quick_profit_sell)
         if extended_profit_sell := os.environ.get("EXTENDED_PROFIT_SELL_PCT"):
@@ -226,6 +263,18 @@ class AppConfig:
             config.trading.buy_fee_rate = float(buy_fee_rate)
         if sell_fee_rate := os.environ.get("SELL_FEE_RATE"):
             config.trading.sell_fee_rate = float(sell_fee_rate)
+        if fee_guard_enabled := os.environ.get("SMALL_POSITION_FEE_GUARD_ENABLED"):
+            config.trading.small_position_fee_guard_enabled = fee_guard_enabled.lower() in {
+                "1", "true", "yes", "on",
+            }
+        if fee_guard_max_cost := os.environ.get("SMALL_POSITION_FEE_GUARD_MAX_COST_THB"):
+            config.trading.small_position_fee_guard_max_cost_thb = float(fee_guard_max_cost)
+        if fee_guard_min_loss := os.environ.get("SMALL_POSITION_FEE_GUARD_MIN_LOSS_BUFFER_THB"):
+            config.trading.small_position_fee_guard_min_loss_buffer_thb = float(fee_guard_min_loss)
+        if fee_guard_multiple := os.environ.get("SMALL_POSITION_FEE_GUARD_FEE_MULTIPLE"):
+            config.trading.small_position_fee_guard_fee_multiple = float(fee_guard_multiple)
+        if fee_guard_max_loss_pct := os.environ.get("SMALL_POSITION_FEE_GUARD_MAX_LOSS_PCT"):
+            config.trading.small_position_fee_guard_max_loss_pct = float(fee_guard_max_loss_pct)
         if break_even_trigger := os.environ.get("BREAK_EVEN_TRIGGER_PCT"):
             config.trading.break_even_trigger_pct = float(break_even_trigger)
         if trailing_stop_enabled := os.environ.get("TRAILING_STOP_ENABLED"):
@@ -264,6 +313,14 @@ class AppConfig:
             }
         if ai_take_profit_min_profit := os.environ.get("AI_TAKE_PROFIT_MIN_PROFIT_PCT"):
             config.trading.ai_take_profit_min_profit_pct = float(ai_take_profit_min_profit)
+        if profit_cashout_enabled := os.environ.get("PROFIT_CASHOUT_ENABLED"):
+            config.trading.profit_cashout_enabled = profit_cashout_enabled.lower() in {
+                "1", "true", "yes", "on",
+            }
+        if profit_cashout_min_profit := os.environ.get("PROFIT_CASHOUT_MIN_PROFIT_PCT"):
+            config.trading.profit_cashout_min_profit_pct = float(profit_cashout_min_profit)
+        if profit_cashout_min_thb := os.environ.get("PROFIT_CASHOUT_MIN_THB"):
+            config.trading.profit_cashout_min_thb = float(profit_cashout_min_thb)
         if ai_take_profit_lstm_conf := os.environ.get("AI_TAKE_PROFIT_MIN_LSTM_CONFIDENCE"):
             config.trading.ai_take_profit_min_lstm_confidence = float(ai_take_profit_lstm_conf)
         if ai_take_profit_rl_conf := os.environ.get("AI_TAKE_PROFIT_MIN_RL_CONFIDENCE"):

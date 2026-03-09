@@ -95,6 +95,26 @@ class TechnicalIndicatorEngine:
         )
         df["atr"] = atr.average_true_range()
         df["atr_pct"] = np.where(df["close"] > 0, (df["atr"] / df["close"]) * 100, 0.0)
+        df["price_change_1_pct"] = np.where(
+            df["close"].shift(1) > 0,
+            ((df["close"] - df["close"].shift(1)) / df["close"].shift(1)) * 100,
+            0.0,
+        )
+        df["price_change_3_pct"] = np.where(
+            df["close"].shift(3) > 0,
+            ((df["close"] - df["close"].shift(3)) / df["close"].shift(3)) * 100,
+            0.0,
+        )
+        df["candle_body_pct"] = np.where(
+            df["open"] > 0,
+            ((df["close"] - df["open"]) / df["open"]) * 100,
+            0.0,
+        )
+        df["close_to_low_pct"] = np.where(
+            df["close"] > 0,
+            ((df["close"] - df["low"]) / df["close"]) * 100,
+            0.0,
+        )
         return df
 
     def add_support_resistance(self, df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
@@ -149,6 +169,10 @@ class TechnicalIndicatorEngine:
             "resistance_distance_pct": latest.get("resistance_distance_pct", 0),
             "atr": latest.get("atr", 0),
             "atr_pct": latest.get("atr_pct", 0),
+            "price_change_1_pct": latest.get("price_change_1_pct", 0),
+            "price_change_3_pct": latest.get("price_change_3_pct", 0),
+            "candle_body_pct": latest.get("candle_body_pct", 0),
+            "close_to_low_pct": latest.get("close_to_low_pct", 0),
             "volume_ratio": latest.get("volume_ratio", 1),
         }
 
@@ -163,5 +187,10 @@ class TechnicalIndicatorEngine:
         signals["high_volume"] = signals["volume_ratio"] > 1.5
         signals["trend_up"] = signals["ema_9"] > signals["ema_21"] > signals["ema_50"] > 0
         signals["trend_down"] = signals["ema_9"] < signals["ema_21"] < signals["ema_50"] if signals["ema_50"] > 0 else False
+        signals["bearish_pressure"] = (
+            signals["candle_body_pct"] <= -0.8
+            and signals["price_change_1_pct"] < 0
+            and signals["close_to_low_pct"] <= 0.5
+        )
 
         return signals

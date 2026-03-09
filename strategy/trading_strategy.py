@@ -31,6 +31,8 @@ class Position:
 class TradingStrategy:
     """Combined strategy using technical indicators + AI predictions."""
 
+    MIN_SELL_VALUE_THB = 10.0
+
     def __init__(self, config: TradingConfig, logger: Optional[TradeLogger] = None):
         self.config = config
         self.logger = logger or TradeLogger()
@@ -71,6 +73,53 @@ class TradingStrategy:
         target_value = entry_cost * (1 + float(target_profit_pct or 0.0) / 100)
         fee_denominator = max(position.amount * (1.0 - self._get_sell_fee_rate()), 1e-9)
         return target_value / fee_denominator
+
+    def get_small_position_fee_guard(self, position: Optional[Position], current_price: float) -> Dict[str, float | bool | str]:
+        """Delay exits on tiny positions when the current loss is still mostly fee noise."""
+        if not position or current_price <= 0 or not getattr(self.config, "small_position_fee_guard_enabled", False):
+            return {
+                "active": False,
+                "entry_cost_thb": 0.0,
+                "loss_pct": 0.0,
+                "loss_thb": 0.0,
+                "max_loss_pct": 0.0,
+                "loss_buffer_thb": 0.0,
+                "reason": "",
+            }
+
+        pnl = self.get_position_pnl(position, current_price)
+        entry_cost = float(pnl["entry_cost_thb"] or 0.0)
+        loss_thb = abs(min(float(pnl["profit_thb"] or 0.0), 0.0))
+        loss_pct = abs(min(float(pnl["profit_pct"] or 0.0), 0.0))
+        fee_loss_buffer = max(
+            float(getattr(self.config, "small_position_fee_guard_min_loss_buffer_thb", 0.0) or 0.0),
+            entry_cost * (self._get_buy_fee_rate() + self._get_sell_fee_rate()) * max(float(getattr(self.config, "small_position_fee_guard_fee_multiple", 0.0) or 0.0), 0.0),
+        )
+        max_cost = max(float(getattr(self.config, "small_position_fee_guard_max_cost_thb", 0.0) or 0.0), 0.0)
+        max_loss_pct = max(float(getattr(self.config, "small_position_fee_guard_max_loss_pct", 0.0) or 0.0), 0.0)
+
+        active = (
+            entry_cost > 0
+            and entry_cost <= max_cost
+            and loss_thb > 0
+            and loss_pct <= max_loss_pct
+            and loss_thb <= fee_loss_buffer
+        )
+        reason = ""
+        if active:
+            reason = (
+                f"Small-position fee guard active: holding {position.symbol} because loss {loss_thb:.2f} THB ({loss_pct:.2f}%) is still within fee-noise buffer {fee_loss_buffer:.2f} THB"
+            )
+
+        return {
+            "active": active,
+            "entry_cost_thb": entry_cost,
+            "loss_pct": loss_pct,
+            "loss_thb": loss_thb,
+            "max_loss_pct": max_loss_pct,
+            "loss_buffer_thb": fee_loss_buffer,
+            "reason": reason,
+        }
 
     def _evaluate_buy_zone(self, signals: Dict, ai_prediction: Dict) -> Dict:
         """Check whether price is inside a favorable auto-buy accumulation zone."""
@@ -133,6 +182,96 @@ class TradingStrategy:
             "reasons": reasons,
         }
 
+    def _build_ai_entry_plan(self, signals: Dict, ai_prediction: Dict) -> Dict:
+        """Build an AI-guided entry zone showing where the bot prefers to buy."""
+        price = float(signals.get("price", 0.0) or 0.0)
+        ema_9 = float(signals.get("ema_9", 0.0) or 0.0)
+        ema_21 = float(signals.get("ema_21", 0.0) or 0.0)
+        support_level = float(signals.get("support_level", 0.0) or 0.0)
+        resistance_level = float(signals.get("resistance_level", 0.0) or 0.0)
+        macd_bullish = bool(signals.get("macd_bullish", False))
+        trend_down = bool(signals.get("trend_down", False))
+        volume_ratio = float(signals.get("volume_ratio", 1.0) or 1.0)
+        ai_direction = ai_prediction.get("direction", "unknown")
+        ai_confidence = float(ai_prediction.get("confidence", 0.0) or 0.0)
+        predicted_price = float(ai_prediction.get("predicted_price", 0.0) or 0.0)
+
+        if price <= 0:
+            return {
+                "mode": "wait",
+                "label": "no-price",
+                "zone_low": 0.0,
+                "zone_high": 0.0,
+                "preferred_entry": 0.0,
+                "trigger_price": 0.0,
+                "chase_limit": 0.0,
+                "entry_ready": False,
+            }
+
+        buffer_pct = max(float(self.config.ai_entry_zone_buffer_pct or 0.0), 0.1)
+        max_chase_pct = max(float(self.config.ai_entry_max_chase_pct or 0.0), 0.2)
+        breakout_trigger = (
+            resistance_level * (1 + self.config.resistance_breakout_pct / 100)
+            if resistance_level > 0 else 0.0
+        )
+
+        anchor_candidates = [candidate for candidate in [support_level, ema_9, ema_21] if candidate > 0]
+        fallback_anchor = min(anchor_candidates) if anchor_candidates else price
+        preferred_entry = fallback_anchor
+        trigger_price = fallback_anchor
+        zone_low = preferred_entry * (1 - buffer_pct / 100)
+        zone_high = preferred_entry * (1 + buffer_pct / 100)
+        chase_limit = preferred_entry * (1 + max_chase_pct / 100)
+        mode = "support"
+        label = "AI support entry"
+
+        if (
+            not trend_down
+            and ema_9 > ema_21 > 0
+            and macd_bullish
+            and ai_direction == "up"
+            and ai_confidence >= self.config.early_recovery_min_ai_confidence
+            and volume_ratio >= self.config.early_recovery_min_volume_ratio
+        ):
+            preferred_entry = max(min(price, ema_9), ema_21)
+            trigger_price = max(ema_9, ema_21)
+            zone_low = preferred_entry * (1 - buffer_pct / 100)
+            zone_high = preferred_entry * (1 + buffer_pct / 100)
+            chase_limit = trigger_price * (1 + max_chase_pct / 100)
+            mode = "early_recovery"
+            label = "AI early recovery entry"
+
+        if breakout_trigger > 0 and ai_direction == "up" and predicted_price > breakout_trigger:
+            preferred_entry = breakout_trigger
+            trigger_price = breakout_trigger
+            zone_low = breakout_trigger * (1 - (buffer_pct * 0.5) / 100)
+            zone_high = breakout_trigger * (1 + buffer_pct / 100)
+            chase_limit = breakout_trigger * (1 + max_chase_pct / 100)
+            mode = "breakout"
+            label = "AI breakout entry"
+
+        if support_level > 0 and ai_direction == "up" and price <= max(ema_9, support_level * 1.01):
+            preferred_entry = max(support_level, zone_low)
+            trigger_price = support_level
+            zone_low = support_level * (1 - buffer_pct / 100)
+            zone_high = max(ema_9 if ema_9 > 0 else price, support_level * (1 + buffer_pct / 100))
+            chase_limit = zone_high * (1 + (max_chase_pct * 0.5) / 100)
+            mode = "pullback"
+            label = "AI pullback entry"
+
+        entry_ready = price >= trigger_price * (1 - buffer_pct / 100) and price <= chase_limit
+
+        return {
+            "mode": mode,
+            "label": label,
+            "zone_low": max(zone_low, 0.0),
+            "zone_high": max(zone_high, 0.0),
+            "preferred_entry": max(preferred_entry, 0.0),
+            "trigger_price": max(trigger_price, 0.0),
+            "chase_limit": max(chase_limit, 0.0),
+            "entry_ready": bool(entry_ready),
+        }
+
     def should_buy(self, signals: Dict, ai_prediction: Dict) -> Dict:
         """Determine if we should BUY when we do not currently hold the coin."""
         reasons = []
@@ -156,6 +295,7 @@ class TradingStrategy:
         falling_trend = ema_9 < ema_21 < ema_50 if ema_50 > 0 else ema_9 < ema_21
         trend_down = bool(signals.get("trend_down", False)) or falling_trend
         buy_zone = self._evaluate_buy_zone(signals, ai_prediction)
+        ai_entry_plan = self._build_ai_entry_plan(signals, ai_prediction)
         if support_distance_pct != support_distance_pct:
             support_distance_pct = float("inf")
         if resistance_distance_pct != resistance_distance_pct:
@@ -180,6 +320,22 @@ class TradingStrategy:
             ai_direction == "up"
             and ai_confidence >= self.config.downtrend_recovery_min_ai_confidence
             and ai_change_pct >= 0.15
+        )
+        price_change_1_pct = float(signals.get("price_change_1_pct", 0.0) or 0.0)
+        price_change_3_pct = float(signals.get("price_change_3_pct", 0.0) or 0.0)
+        candle_body_pct = float(signals.get("candle_body_pct", 0.0) or 0.0)
+        close_to_low_pct = float(signals.get("close_to_low_pct", 0.0) or 0.0)
+        dump_protection_active = (
+            self.config.dump_guard_enabled
+            and (
+                (
+                    candle_body_pct <= -self.config.dump_single_candle_drop_pct
+                    and price_change_1_pct <= -self.config.dump_single_candle_drop_pct
+                    and close_to_low_pct <= self.config.dump_near_low_buffer_pct
+                    and volume_ratio >= self.config.dump_volume_ratio_min
+                )
+                or price_change_3_pct <= -self.config.dump_three_candle_drop_pct
+            )
         )
         downtrend_recovery_ready = (
             trend_down
@@ -208,6 +364,16 @@ class TradingStrategy:
             and breakout_resistance
             and ai_direction == "up"
             and ai_confidence >= self.config.trend_buy_min_ai_confidence
+        )
+        early_recovery_entry = (
+            not trend_down
+            and ema_9 > ema_21 > 0
+            and price >= ema_9
+            and signals.get("macd_bullish", False)
+            and ai_direction == "up"
+            and ai_confidence >= self.config.early_recovery_min_ai_confidence
+            and volume_ratio >= self.config.early_recovery_min_volume_ratio
+            and price <= ai_entry_plan.get("chase_limit", price)
         )
         counter_trend_reversal = (
             trend_down
@@ -317,6 +483,10 @@ class TradingStrategy:
             score += 0.7
             reasons.append("Uptrend breakout entry confirmed above resistance")
 
+        if early_recovery_entry:
+            score += 0.85
+            reasons.append("Early recovery entry confirmed: market structure improved and AI found a low-chase entry")
+
         if counter_trend_reversal:
             score += 0.95
             reasons.append("Counter-trend reversal allowed: strong AI rebound from support")
@@ -332,6 +502,12 @@ class TradingStrategy:
             score -= 0.4
             reasons.append(f"Volume too light ({volume_ratio:.2f}x), skipping weak setup")
 
+        if dump_protection_active:
+            score -= 1.25
+            reasons.append(
+                "Dump protection active: price is being dragged down with heavy bearish pressure, waiting for stabilization"
+            )
+
         if trend_down and not (dip_buy or counter_trend_reversal):
             score -= 1.15
             reasons.append("Downtrend protection active: waiting for EMA9 reclaim, bullish MACD, and strong AI volume confirmation")
@@ -341,6 +517,7 @@ class TradingStrategy:
             or trend_buy
             or uptrend_pullback
             or uptrend_breakout
+            or early_recovery_entry
             or counter_trend_reversal
             or range_auto_buy
         )
@@ -350,7 +527,7 @@ class TradingStrategy:
 
         effective_score = max(score, self.config.min_buy_signal_score) if valid_entry_setup else score
 
-        should = valid_entry_setup and effective_score >= self.config.min_buy_signal_score
+        should = valid_entry_setup and effective_score >= self.config.min_buy_signal_score and not dump_protection_active
 
         return {
             "should_buy": should,
@@ -363,8 +540,11 @@ class TradingStrategy:
             "trend_buy": trend_buy,
             "near_support": near_support,
             "breakout_resistance": breakout_resistance,
+            "early_recovery_entry": early_recovery_entry,
             "counter_trend_reversal": counter_trend_reversal,
             "downtrend_protection_active": trend_down and not counter_trend_reversal,
+            "dump_protection_active": dump_protection_active,
+            "ai_entry_plan": ai_entry_plan,
         }
 
     def should_sell(self, signals: Dict, ai_prediction: Dict,
@@ -453,6 +633,10 @@ class TradingStrategy:
             score -= 0.75
             reasons.append("Strong bullish AI bias delays sell")
 
+        fee_guard = self.get_small_position_fee_guard(position, price)
+        if fee_guard["active"] and not profit_lock_sell and not extended_rally_sell:
+            reasons.append(str(fee_guard["reason"]))
+
         should = score >= self.config.min_sell_signal_score and (
             panic_sell
             or profit_lock_sell
@@ -461,6 +645,8 @@ class TradingStrategy:
             or trend_weak
             or rsi >= self.config.rsi_sell_threshold + 4
         )
+        if fee_guard["active"] and not profit_lock_sell and not extended_rally_sell:
+            should = False
 
         return {
             "should_sell": should,
@@ -470,6 +656,7 @@ class TradingStrategy:
             "panic_sell": panic_sell,
             "profit_lock_sell": profit_lock_sell,
             "extended_rally_sell": extended_rally_sell,
+            "fee_guard_active": bool(fee_guard["active"]),
         }
 
     def get_position_pnl(self, position: Position, current_price: float,
@@ -492,6 +679,75 @@ class TradingStrategy:
             "sell_fee_thb": sell_fee_thb,
             "effective_entry_price": effective_entry_price,
             "break_even_exit_price": break_even_exit_price,
+        }
+
+    def evaluate_profit_cashout(self, position: Position, current_price: float) -> Dict[str, float | bool | str]:
+        """Decide whether we should skim only the current profit into THB and keep principal in coin."""
+        pnl = self.get_position_pnl(position, current_price)
+        principal_thb = float(pnl["entry_cost_thb"] or 0.0)
+        profit_thb = float(pnl["profit_thb"] or 0.0)
+        profit_pct = float(pnl["profit_pct"] or 0.0)
+        total_net_value_thb = float(pnl["net_exit_value_thb"] or 0.0)
+
+        if (
+            not getattr(self.config, "profit_cashout_enabled", False)
+            or current_price <= 0
+            or position.amount <= 0
+            or principal_thb <= 0
+            or profit_thb <= 0
+        ):
+            return {
+                "should_cashout": False,
+                "sell_amount": 0.0,
+                "profit_thb": profit_thb,
+                "profit_pct": profit_pct,
+                "cashout_value_thb": 0.0,
+                "principal_thb": principal_thb,
+                "remaining_amount": float(position.amount or 0.0),
+                "reason": "",
+            }
+
+        min_profit_pct = max(float(getattr(self.config, "profit_cashout_min_profit_pct", 0.0) or 0.0), 0.0)
+        min_profit_thb = max(float(getattr(self.config, "profit_cashout_min_thb", 0.0) or 0.0), self.MIN_SELL_VALUE_THB)
+
+        if profit_pct < min_profit_pct or profit_thb < min_profit_thb or total_net_value_thb <= principal_thb:
+            return {
+                "should_cashout": False,
+                "sell_amount": 0.0,
+                "profit_thb": profit_thb,
+                "profit_pct": profit_pct,
+                "cashout_value_thb": 0.0,
+                "principal_thb": principal_thb,
+                "remaining_amount": float(position.amount or 0.0),
+                "reason": "",
+            }
+
+        sell_amount = max(
+            float(position.amount) - (principal_thb / max(current_price * (1.0 - self._get_sell_fee_rate()), 1e-9)),
+            0.0,
+        )
+        sell_amount = min(sell_amount, float(position.amount))
+        remaining_amount = max(float(position.amount) - sell_amount, 0.0)
+        cashout_value_thb = self.estimate_exit_value_thb(sell_amount, current_price)
+
+        should_cashout = (
+            sell_amount > 0
+            and remaining_amount > 0
+            and cashout_value_thb >= self.MIN_SELL_VALUE_THB
+        )
+
+        return {
+            "should_cashout": should_cashout,
+            "sell_amount": sell_amount,
+            "profit_thb": profit_thb,
+            "profit_pct": profit_pct,
+            "cashout_value_thb": cashout_value_thb,
+            "principal_thb": principal_thb,
+            "remaining_amount": remaining_amount,
+            "reason": (
+                f"Cash out current profit {cashout_value_thb:,.2f} THB and keep principal {principal_thb:,.2f} THB in coin"
+                if should_cashout else ""
+            ),
         }
 
     def get_adaptive_risk_profile(self, signals: Dict, ai_prediction: Dict,
@@ -694,6 +950,18 @@ class TradingStrategy:
                 "score": 99.0,
                 "reasons": reasons,
                 "reason": "AI_CUTLOSS_TO_THB: " + "; ".join(reasons),
+                "loss_pct": loss_pct,
+                "profit_thb": pnl["profit_thb"],
+            }
+
+        fee_guard = self.get_small_position_fee_guard(position, current_price)
+        if fee_guard["active"]:
+            reasons.append(str(fee_guard["reason"]))
+            return {
+                "should_sell": False,
+                "score": 0.0,
+                "reasons": reasons,
+                "reason": "",
                 "loss_pct": loss_pct,
                 "profit_thb": pnl["profit_thb"],
             }
@@ -944,6 +1212,9 @@ class TradingStrategy:
         position.stop_loss_price = dynamic_stop
 
         if current_price <= position.stop_loss_price:
+            fee_guard = self.get_small_position_fee_guard(position, current_price)
+            if fee_guard["active"]:
+                return False
             self.logger.log_stop_loss(
                 position.symbol, position.entry_price, current_price, abs(pnl["profit_pct"])
             )
@@ -1024,6 +1295,77 @@ class TradingStrategy:
         self.logger.log_trade(
             "SELL", position.symbol, exit_price, position.amount,
             f"{reason} | Net P/L: {profit_pct:.2f}% | Fees: {position.entry_fee_thb + resolved_sell_fee:.2f} THB"
+        )
+        return trade_record
+
+    def cash_out_profit(self, position: Position, exit_price: float, sell_amount: float,
+                        reason: str = "PROFIT_CASHOUT_TO_THB",
+                        net_exit_value_thb: Optional[float] = None,
+                        sell_fee_thb: Optional[float] = None):
+        """Sell only the profit portion into THB, then rebase the remaining position as principal still held in coin."""
+        if sell_amount <= 0 or position.amount <= 0:
+            return None
+
+        if sell_amount >= position.amount:
+            return self.close_position(
+                position,
+                exit_price,
+                reason,
+                net_exit_value_thb=net_exit_value_thb,
+                sell_fee_thb=sell_fee_thb,
+            )
+
+        original_entry_cost_thb = position.entry_cost_thb if position.entry_cost_thb > 0 else self.estimate_entry_cost_thb(position.entry_price, position.amount)
+        original_amount = float(position.amount)
+        sold_amount = min(float(sell_amount), original_amount)
+        sold_net_exit_value_thb = float(net_exit_value_thb) if net_exit_value_thb is not None else self.estimate_exit_value_thb(sold_amount, exit_price)
+        sold_gross_exit_value_thb = sold_amount * float(exit_price)
+        resolved_sell_fee = float(sell_fee_thb) if sell_fee_thb is not None else max(sold_gross_exit_value_thb - sold_net_exit_value_thb, 0.0)
+        remaining_amount = max(original_amount - sold_amount, 0.0)
+
+        if remaining_amount <= 0:
+            return self.close_position(
+                position,
+                exit_price,
+                reason,
+                net_exit_value_thb=sold_net_exit_value_thb,
+                sell_fee_thb=resolved_sell_fee,
+            )
+
+        trade_record = {
+            "symbol": position.symbol,
+            "entry_price": position.entry_price,
+            "entry_cost_thb": original_entry_cost_thb,
+            "entry_fee_thb": position.entry_fee_thb,
+            "exit_price": exit_price,
+            "amount": sold_amount,
+            "gross_exit_value_thb": sold_gross_exit_value_thb,
+            "net_exit_value_thb": sold_net_exit_value_thb,
+            "sell_fee_thb": resolved_sell_fee,
+            "total_fee_thb": position.entry_fee_thb + resolved_sell_fee,
+            "profit_pct": (sold_net_exit_value_thb / original_entry_cost_thb * 100) if original_entry_cost_thb > 0 else 0.0,
+            "profit_thb": sold_net_exit_value_thb,
+            "entry_time": position.entry_time.isoformat(),
+            "exit_time": datetime.now().isoformat(),
+            "reason": reason,
+            "partial_close": True,
+            "remaining_amount": remaining_amount,
+            "remaining_entry_cost_thb": original_entry_cost_thb,
+        }
+        self.trade_history.append(trade_record)
+
+        position.amount = remaining_amount
+        position.entry_cost_thb = original_entry_cost_thb
+        position.entry_fee_thb = 0.0
+        position.entry_price = original_entry_cost_thb / remaining_amount if remaining_amount > 0 else exit_price
+        position.entry_time = datetime.now()
+        position.highest_price = exit_price
+        position.stop_loss_price = self.get_required_exit_price(position, -self.config.stop_loss_pct)
+        position.take_profit_price = self.get_required_exit_price(position, self.config.take_profit_pct)
+
+        self.logger.log_trade(
+            "CASHOUT", position.symbol, exit_price, sold_amount,
+            f"{reason} | Cashout: {sold_net_exit_value_thb:.2f} THB | Remaining principal in coin: {original_entry_cost_thb:.2f} THB"
         )
         return trade_record
 

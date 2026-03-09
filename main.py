@@ -250,9 +250,9 @@ class TradingBot:
 
             # Take Profit
             if self.strategy.check_take_profit(position, current_price):
-                trade_record = self._execute_sell(position, current_price, "TAKE_PROFIT_TO_THB")
+                trade_record = self._execute_sell(position, current_price, "TAKE_PROFIT_TO_THB", keep_principal=True)
                 if trade_record:
-                    return "TAKE_PROFIT"
+                    return "PROFIT_CASHOUT" if trade_record.get("partial_close") else "TAKE_PROFIT"
 
         return ""
 
@@ -289,7 +289,12 @@ class TradingBot:
                     position, current_price,
                     "SELL_SIGNAL_TO_THB: " + "; ".join(
                         list(sell_decision["reasons"]) + ([f"LLM: {llm_sell_advice.get('reason', '')}"] if llm_sell_advice.get("used") else [])
-                    )
+                    ),
+                    keep_principal=bool(
+                        getattr(self.config.trading, "profit_cashout_enabled", False)
+                        and (sell_decision.get("profit_lock_sell") or sell_decision.get("extended_rally_sell"))
+                        and not sell_decision.get("panic_sell")
+                    ),
                 )
                 sold_any = sold_any or bool(trade_record)
             if sold_any:
@@ -388,25 +393,47 @@ class TradingBot:
             return order
         return None
 
-    def _execute_sell(self, position, current_price: float, reason: str):
+    def _execute_sell(self, position, current_price: float, reason: str,
+                      keep_principal: bool = False):
         """Execute a sell order back into THB."""
-        estimated_value = position.amount * current_price
+        cashout_plan = None
+        sell_amount = position.amount
+        if keep_principal:
+            cashout_plan = self.strategy.evaluate_profit_cashout(position, current_price)
+            if cashout_plan["should_cashout"]:
+                sell_amount = float(cashout_plan["sell_amount"] or 0.0)
+            else:
+                keep_principal = False
+
+        estimated_value = sell_amount * current_price
         if estimated_value < 10:
-            if position in self.strategy.positions:
+            if not keep_principal and position in self.strategy.positions:
                 self.strategy.positions.remove(position)
             self.logger.log_info(
-                f"Skipping sell for {position.symbol}: remaining value {estimated_value:.2f} THB is below Bitkub minimum; position removed from bot tracking"
+                (
+                    f"Skipping profit cashout for {position.symbol}: sell value {estimated_value:.2f} THB is below Bitkub minimum"
+                    if keep_principal else
+                    f"Skipping sell for {position.symbol}: remaining value {estimated_value:.2f} THB is below Bitkub minimum; position removed from bot tracking"
+                )
             )
             return None
 
         if self.paper_trade_enabled:
-            trade_record = self.strategy.close_position(position, current_price, reason)
+            if keep_principal and cashout_plan and cashout_plan["should_cashout"]:
+                trade_record = self.strategy.cash_out_profit(
+                    position,
+                    current_price,
+                    float(cashout_plan["sell_amount"] or 0.0),
+                    reason,
+                )
+            else:
+                trade_record = self.strategy.close_position(position, current_price, reason)
             if trade_record:
                 self.paper_balance_thb += float(trade_record.get("net_exit_value_thb", 0.0) or 0.0)
                 self.risk_manager.record_trade_result(trade_record["profit_thb"])
             return trade_record
 
-        order = self.client.create_sell_order(position.symbol, position.amount)
+        order = self.client.create_sell_order(position.symbol, sell_amount)
         if "_error" in order:
             self.logger.log_error(
                 "execute_sell",
@@ -424,12 +451,21 @@ class TradingBot:
         if order:
             exit_price = order.get("rate", current_price)
 
-        trade_record = self.strategy.close_position(
-            position,
-            exit_price,
-            reason,
-            net_exit_value_thb=float(order.get("received", 0.0) or 0.0),
-        )
+        if keep_principal and cashout_plan and cashout_plan["should_cashout"]:
+            trade_record = self.strategy.cash_out_profit(
+                position,
+                exit_price,
+                float(order.get("amount", sell_amount) or sell_amount),
+                reason,
+                net_exit_value_thb=float(order.get("received", 0.0) or 0.0),
+            )
+        else:
+            trade_record = self.strategy.close_position(
+                position,
+                exit_price,
+                reason,
+                net_exit_value_thb=float(order.get("received", 0.0) or 0.0),
+            )
         if trade_record:
             self.risk_manager.record_trade_result(trade_record["profit_thb"])
         return trade_record
